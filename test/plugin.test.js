@@ -147,7 +147,7 @@ test('reset 工具清空飞轮', async () => {
 
 test('messageFeedback 结算：回合结束 45s 后按人类点踩修正奖励', async () => {
   const home = mkdtempSync(join(tmpdir(), 'dsh-router-mf-'))
-  const negativeItem = { messageId: 'm1', rating: 'negative', createdAt: Date.now() }
+  const negativeItem = { messageId: 'm1', rating: 'negative', createdAt: Date.now() + 60000 }
   const mf = { async list() { return { ok: true, value: { items: [negativeItem] } } } }
   let sweepFn = null
   const timer = { interval(fn) { sweepFn = fn; return () => {} } }
@@ -193,4 +193,58 @@ test('messageFeedback 缺失时优雅降级（不报错、不结算）', async (
   await stop(payload('s1', 1))
   const store = new Store(home)
   assert.ok(store.loadJsonl('rewards.jsonl').every((r) => r.type !== 'feedback-settle'))
+})
+
+test('成本信号：llm/stream 透传并累加 usage，奖励按成本扣分', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-router-cost-'))
+  const ctx = mockCtx({})
+  apply(ctx, { home })
+  const req = ctx.listeners['agent/request']
+  const pre = ctx.listeners['agent/pre-step']
+  const stop = ctx.listeners['agent/turn-stopping']
+  const stream = ctx.listeners['llm/stream']
+  assert.ok(stream, '应挂载 llm/stream 监听')
+
+  await pre({ ...payload('s1', 1), messages: [{ content: [{ type: 'text', text: QA_TASK }] }] }, async () => ({}))
+  await req(payload('s1', 1), async () => ({ provider: 'deepseek-official', model: 'deepseek-v4-pro' }))
+
+  // 模拟一次流式调用：文本 + usage chunk（strong 档 100k 输入 100k 输出）
+  const chunks = []
+  const wrapped = stream({ sessionId: 's1' }, async function* () {
+    yield { type: 'text-delta', text: '月球' }
+    yield { type: 'usage', usage: { inputTokens: 100000, outputTokens: 100000 } }
+  })
+  for await (const c of wrapped) chunks.push(c)
+  assert.equal(chunks.length, 2, '所有 chunk 必须透传')
+  assert.equal(chunks[0].text, '月球')
+
+  await stop(payload('s1', 1))
+  const store = new Store(home)
+  const rewards = store.loadJsonl('rewards.jsonl')
+  // strong 档成本 = (100000×1 + 100000×12)/1e6 = 1.3 元 → 惩罚封顶 0.5
+  assert.equal(rewards[0].breakdown.costYuan, 1.3)
+  assert.equal(rewards[0].breakdown.costPenalty, 0.5)
+  assert.equal(rewards[0].reward, 0.5)
+})
+
+test('成本信号：无 usage 的 provider 走估算兜底（estimated 标记）', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-router-costest-'))
+  const ctx = mockCtx({})
+  apply(ctx, { home })
+  const req = ctx.listeners['agent/request']
+  const pre = ctx.listeners['agent/pre-step']
+  const stop = ctx.listeners['agent/turn-stopping']
+  const stream = ctx.listeners['llm/stream']
+
+  await pre({ ...payload('s1', 1), messages: [{ content: [{ type: 'text', text: QA_TASK }] }] }, async () => ({}))
+  await req(payload('s1', 1), async () => ({ provider: 'deepseek-official', model: 'deepseek-v4-pro' }))
+  const wrapped = stream({ sessionId: 's1' }, async function* () {
+    yield { type: 'text-delta', text: 'H2O' }
+    yield { type: 'finish', reason: 'stop' }
+  })
+  for await (const c of wrapped) { /* 透传 */ }
+  await stop(payload('s1', 1))
+  const rewards = new Store(home).loadJsonl('rewards.jsonl')
+  assert.ok(rewards[0].breakdown.costYuan > 0, '估算成本应 > 0')
+  assert.ok(rewards[0].breakdown.costYuan < 0.01, '小回合成本应很小')
 })

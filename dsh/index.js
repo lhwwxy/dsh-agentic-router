@@ -16,6 +16,7 @@ import {
   tierOf, tierTarget, resolveTier,
   recommendRule, recommendUcb, recommendLin, recommendKnn,
   rewardOf, applyReward, correctReward,
+  DEFAULT_PRICES, turnCostYuan,
 } from './strategies.js'
 import { metaPick, DEFAULT_WEIGHTS } from './meta.js'
 import { Store, defaultHome } from './store.js'
@@ -132,6 +133,9 @@ export function apply(ctx, config = {}) {
   const timer = ctx.get('timer')
   const store = new Store(config.home || defaultHome())
   const settleDelayMs = typeof config.settleDelayMs === 'number' ? config.settleDelayMs : SETTLE_DELAY_MS
+  const prices = config.prices || DEFAULT_PRICES
+  const costWeight = typeof config.costWeight === 'number' ? config.costWeight : 20
+  const costCap = typeof config.costCap === 'number' ? config.costCap : 0.5
   const policy = store.loadPolicy()
 
   const state = freshState()
@@ -273,6 +277,8 @@ export function apply(ctx, config = {}) {
       state.turnDecision[key] = {
         clsType: cls.type, f, recs, meta, chosen: meta.chosen,
         finalized: false, t0: now(), toolErrors: 0, retries: 0,
+        currentModel: current, costWeight, costCap,
+        estInputTokens: Math.ceil(text.length / 1.5),
       }
       state.openTurns.set(agentKey(payload), key)
       store.appendJsonl('decisions.jsonl', record)
@@ -304,6 +310,48 @@ export function apply(ctx, config = {}) {
       log('request-error hook failed: ' + String(e))
     }
     return next()
+  })
+
+  // 成本信号：透传每次流式模型调用，累加 usage chunk 到当前 open turn；
+  // 无 usage 的 provider 用文本长度估算（estimated=true）
+  ctx.on('llm/stream', function (options, next) {
+    return (async function* () {
+      let usage = null
+      let outTextLen = 0
+      try {
+        for await (const chunk of next()) {
+          if (chunk && chunk.type === 'usage' && chunk.usage) usage = chunk.usage
+          if (chunk && chunk.type === 'text-delta' && typeof chunk.text === 'string') outTextLen += chunk.text.length
+          yield chunk
+        }
+      } finally {
+        try {
+          const sid = options && (options.sessionId || (options.session && options.session.id))
+          const key = sid ? state.openTurns.get(sid) : null
+          const td = key ? state.turnDecision[key] : null
+          if (td && !td.finalized) {
+            const u = td.usage || { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, reasoningTokens: 0, estimated: false }
+            if (usage && typeof usage.inputTokens === 'number') {
+              u.inputTokens += usage.inputTokens
+              u.outputTokens += usage.outputTokens || 0
+              u.cacheReadTokens += usage.cacheReadTokens || 0
+              u.reasoningTokens += usage.reasoningTokens || 0
+              u.estimated = false
+            } else {
+              u.inputTokens += td.estInputTokens || 0
+              u.outputTokens += Math.round(outTextLen / 2)
+              u.estimated = true
+            }
+            td.usage = u
+            const tier = tierOf(typeof td.currentModel === 'string' ? td.currentModel : '')
+            td.costYuan = turnCostYuan(u, tier, prices)
+            log('usage on ' + key + ': in=' + u.inputTokens + ' out=' + u.outputTokens + (u.estimated ? ' (估)' : '') + ' cost=¥' + td.costYuan.toFixed(4))
+          }
+        } catch (e) {
+          log('usage hook failed: ' + String(e))
+        }
+      }
+    })()
   })
 
   ctx.on('tools/result', (exec, result) => {

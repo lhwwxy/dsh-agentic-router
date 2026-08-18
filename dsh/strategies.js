@@ -105,23 +105,47 @@ export function recommendKnn(cls, f, knnState) {
   return { tier: best.tier, reason: 'knn k=' + k + ' neighbors score=' + Math.round(best.score * 100) / 100, conf: Math.min(0.8, pool.length / 100) }
 }
 
-// 质量代理奖励：干净收尾 1 分起，扣工具失败(0.2/次，封顶 0.6)、模型重试(0.2/次，封顶 0.4)、延迟(>90s −0.3, >30s −0.1)
+// ---- 成本信号（token 计费） ----
+// 默认价格表：DeepSeek 官方口径（元/百万 tokens），可按 config.prices 覆盖
+export const DEFAULT_PRICES = {
+  fast: { in: 0.2, out: 2 },
+  mid: { in: 0.5, out: 6 },
+  strong: { in: 1, out: 12 },
+}
+
+// 单回合成本（元）：缓存读计入输入，推理 token 计入输出
+export function turnCostYuan(usage, tier, prices) {
+  if (!usage) return 0
+  const table = prices || DEFAULT_PRICES
+  const p = table[tier] || table.mid || DEFAULT_PRICES.mid
+  const input = (usage.inputTokens || 0) + (usage.cacheReadTokens || 0)
+  const output = (usage.outputTokens || 0) + (usage.reasoningTokens || 0)
+  return (p.in * input + p.out * output) / 1e6
+}
+
+// 质量代理奖励：干净收尾 1 分起，扣工具失败(0.2/次，封顶 0.6)、模型重试(0.2/次，封顶 0.4)、
+// 延迟(>90s −0.3, >30s −0.1)、成本(min(cap, weight × 元)，默认 weight=20 即每 0.01 元 −0.2)
 export function rewardOf(td, tag, dtMs) {
   if (tag !== 'clean-close') {
-    return { reward: 0, breakdown: { base: 0, toolErrors: td.toolErrors || 0, retries: td.retries || 0, dtMs } }
+    return { reward: 0, breakdown: { base: 0, toolErrors: td.toolErrors || 0, retries: td.retries || 0, dtMs, costYuan: td.costYuan || 0, costPenalty: 0 } }
   }
   let reward = 1
   const toolPenalty = Math.min(0.6, 0.2 * (td.toolErrors || 0))
   const retryPenalty = Math.min(0.4, 0.2 * (td.retries || 0))
+  const costCap = typeof td.costCap === 'number' ? td.costCap : 0.5
+  const costWeight = typeof td.costWeight === 'number' ? td.costWeight : 20
+  const costYuan = typeof td.costYuan === 'number' ? td.costYuan : 0
+  const costPenalty = Math.min(costCap, costWeight * costYuan)
   reward -= toolPenalty
   reward -= retryPenalty
+  reward -= costPenalty
   if (dtMs != null) {
     if (dtMs > 90000) reward -= 0.3
     else if (dtMs > 30000) reward -= 0.1
   }
   return {
     reward: Math.max(0, Math.round(reward * 100) / 100),
-    breakdown: { base: 1, toolErrors: td.toolErrors || 0, toolPenalty, retries: td.retries || 0, retryPenalty, dtMs },
+    breakdown: { base: 1, toolErrors: td.toolErrors || 0, toolPenalty, retries: td.retries || 0, retryPenalty, costYuan, costPenalty, dtMs },
   }
 }
 

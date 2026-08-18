@@ -50,12 +50,23 @@ Directory: `${DSH_HOME:-~/.dsh}/storages/dsh-agentic-router/` (override with `AG
 - Human feedback: 45s after a turn closes, the plugin polls `messageFeedback` (the Web UI 👍/👎); a thumbs-down costs −0.5, a thumbs-up adds +0.1, applied as an exact correction to the already-applied reward
 - `policy.json` — mode and forced model (atomic write)
 
-Reward: clean close starts at 1; tool failures −0.2 each (cap 0.6), model retries −0.2 each (cap 0.4), latency >30s −0.1 / >90s −0.3; errored turns score 0.
+Reward: clean close starts at 1; tool failures −0.2 each (cap 0.6), model retries −0.2 each (cap 0.4),
+**cost** min(0.5, 20 × turn cost in CNY), latency >30s −0.1 / >90s −0.3; errored turns score 0.
+
+**Cost signal (token billing)**: the plugin wraps `llm/stream` and accumulates each model
+call's `usage` chunk (input/output/cache-read/reasoning tokens); providers without usage
+fall back to length-based estimates (flagged `estimated`). Default price table follows
+DeepSeek's official pricing (CNY per million tokens), overridable:
+
+```js
+// config.prices / config.costWeight / config.costCap
+{ fast: { in: 0.2, out: 2 }, mid: { in: 0.5, out: 6 }, strong: { in: 1, out: 12 } }
+```
 
 ## Known limits
 
 - Model tiers are recognized by id keywords (flash→fast, pro→strong); real swaps happen only when more than one tier exists
-- Feedback settles after a 45s window (configurable via `settleDelayMs`); unsettled pending entries are lost on restart
+- Feedback settles after a 45s window (configurable via `settleDelayMs`); unsettled pending entries are lost on restart; late feedback may be attributed to a later turn
 - Feedback only works where the deployment's Web UI actually writes it (this plugin only reads)
 - LinUCB / k-NN need dozens of turns before they graduate into the meta pool
 

@@ -5,6 +5,7 @@ import {
   tierOf, tierTarget, resolveTier,
   recommendRule, recommendUcb, recommendLin, recommendKnn,
   rewardOf, applyReward, correctReward,
+  DEFAULT_PRICES, turnCostYuan,
 } from '../dsh/strategies.js'
 import { metaPick, DEFAULT_WEIGHTS } from '../dsh/meta.js'
 
@@ -156,4 +157,28 @@ test('correctReward：无变化时不修正', () => {
   const snapshot = JSON.stringify(state.ucb)
   correctReward(state, rec, 0.8)
   assert.equal(JSON.stringify(state.ucb), snapshot)
+})
+
+test('turnCostYuan：按档位价格表计算（缓存读计入输入、推理计入输出）', () => {
+  const usage = { inputTokens: 1000, outputTokens: 100, cacheReadTokens: 500, reasoningTokens: 50 }
+  // fast: (1500×0.2 + 150×2)/1e6 = 0.0006
+  assert.ok(Math.abs(turnCostYuan(usage, 'fast', DEFAULT_PRICES) - 0.0006) < 1e-9)
+  // strong: (1500×1 + 150×12)/1e6 = 0.0033
+  assert.ok(Math.abs(turnCostYuan(usage, 'strong', DEFAULT_PRICES) - 0.0033) < 1e-9)
+  assert.equal(turnCostYuan(null, 'fast', DEFAULT_PRICES), 0)
+  // 自定义价格表覆盖
+  assert.equal(turnCostYuan({ inputTokens: 1e6, outputTokens: 0 }, 'fast', { fast: { in: 3, out: 5 } }), 3)
+})
+
+test('rewardOf 成本项：weight×元封顶 cap', () => {
+  const td = { toolErrors: 0, retries: 0, costYuan: 0.02, costWeight: 20, costCap: 0.5 }
+  const r = rewardOf(td, 'clean-close', 1000)
+  assert.ok(Math.abs(r.reward - 0.6) < 1e-9, '1 − 0.4 = 0.6，实际 ' + r.reward)
+  assert.equal(r.breakdown.costPenalty, 0.4)
+  assert.equal(r.breakdown.costYuan, 0.02)
+
+  const td2 = { toolErrors: 0, retries: 0, costYuan: 0.1, costWeight: 20, costCap: 0.5 }
+  const r2 = rewardOf(td2, 'clean-close', 1000)
+  assert.equal(r2.breakdown.costPenalty, 0.5, '惩罚封顶 0.5')
+  assert.equal(r2.reward, 0.5)
 })
