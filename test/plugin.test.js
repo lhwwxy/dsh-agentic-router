@@ -7,7 +7,7 @@ import { join } from 'node:path'
 import { apply, name, inject } from '../dsh/index.js'
 import { Store } from '../dsh/store.js'
 
-function mockCtx() {
+function mockCtx(opts = {}) {
   const listeners = {}
   const registered = []
   return {
@@ -23,6 +23,8 @@ function mockCtx() {
           async listModels() { return [{ id: 'deepseek-v4-flash' }, { id: 'deepseek-v4-pro' }] },
         }
       }
+      if (k === 'messageFeedback') return opts.mf
+      if (k === 'timer') return opts.timer
       return undefined
     },
     on(ev, fn) { listeners[ev] = fn; return () => {} },
@@ -141,4 +143,54 @@ test('reset 工具清空飞轮', async () => {
   const stats = await ctx.registered.find((t) => t.name === 'agentic_router_stats').execute({}, {})
   assert.equal(stats.flywheel.ucb.total, 0)
   assert.equal(stats.totalDecisions, 0)
+})
+
+test('messageFeedback 结算：回合结束 45s 后按人类点踩修正奖励', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-router-mf-'))
+  const negativeItem = { messageId: 'm1', rating: 'negative', createdAt: Date.now() }
+  const mf = { async list() { return { ok: true, value: { items: [negativeItem] } } } }
+  let sweepFn = null
+  const timer = { interval(fn) { sweepFn = fn; return () => {} } }
+  const ctx = mockCtx({ mf, timer })
+  apply(ctx, { home, settleDelayMs: 0 })
+
+  const req = ctx.listeners['agent/request']
+  const pre = ctx.listeners['agent/pre-step']
+  const stop = ctx.listeners['agent/turn-stopping']
+  await pre({ ...payload('s1', 1), messages: [{ content: [{ type: 'text', text: QA_TASK }] }] }, async () => ({}))
+  await req(payload('s1', 1), async () => ({ provider: 'deepseek-official', model: 'deepseek-v4-pro' }))
+  await stop(payload('s1', 1))
+
+  // 结算前：奖励 1，UCB mean 1
+  const store = new Store(home)
+  assert.equal(store.loadJsonl('rewards.jsonl')[0].reward, 1)
+
+  // 触发结算轮询（settleDelayMs=0 立即到期）
+  assert.ok(sweepFn, '应注册结算轮询')
+  await sweepFn()
+
+  const rewards = store.loadJsonl('rewards.jsonl')
+  const settle = rewards.find((r) => r.type === 'feedback-settle')
+  assert.ok(settle, '应产生 feedback-settle 记录')
+  assert.equal(settle.negative, 1)
+  assert.equal(settle.applied, 1)
+  assert.equal(settle.newReward, 0.5)
+
+  const stats = await ctx.registered.find((t) => t.name === 'agentic_router_stats').execute({}, {})
+  assert.equal(stats.flywheel.ucb.arms['qa:fast'].mean, 0.5, '飞轮均值应被修正')
+  assert.equal(stats.flywheel.pendingFeedback, 0, '结算后 pending 清空')
+})
+
+test('messageFeedback 缺失时优雅降级（不报错、不结算）', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-router-mfnone-'))
+  const ctx = mockCtx({})
+  apply(ctx, { home, settleDelayMs: 0 })
+  const req = ctx.listeners['agent/request']
+  const pre = ctx.listeners['agent/pre-step']
+  const stop = ctx.listeners['agent/turn-stopping']
+  await pre({ ...payload('s1', 1), messages: [{ content: [{ type: 'text', text: QA_TASK }] }] }, async () => ({}))
+  await req(payload('s1', 1), async () => ({ provider: 'deepseek-official', model: 'deepseek-v4-pro' }))
+  await stop(payload('s1', 1))
+  const store = new Store(home)
+  assert.ok(store.loadJsonl('rewards.jsonl').every((r) => r.type !== 'feedback-settle'))
 })

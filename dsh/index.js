@@ -15,7 +15,7 @@ import { classify, featuresOf } from './classify.js'
 import {
   tierOf, tierTarget, resolveTier,
   recommendRule, recommendUcb, recommendLin, recommendKnn,
-  rewardOf, applyReward,
+  rewardOf, applyReward, correctReward,
 } from './strategies.js'
 import { metaPick, DEFAULT_WEIGHTS } from './meta.js'
 import { Store, defaultHome } from './store.js'
@@ -25,6 +25,8 @@ export const inject = ['tools']
 
 const LIN_GRADUATION = 50   // LinUCB 毕业样本线
 const KNN_GRADUATION = 30   // k-NN 毕业经验线
+const SETTLE_DELAY_MS = 45000 // 反馈结算窗口：回合结束 45s 后查询 messageFeedback
+const SWEEP_MS = 15000        // 结算轮询周期
 
 function freshState() {
   return {
@@ -36,6 +38,8 @@ function freshState() {
     modelTiers: null,
     turnDecision: {},
     openTurns: new Map(),
+    pendingFeedback: [],
+    recByTurn: new Map(),
     ucb: { total: 0, arms: {} },
     lin: {
       total: 0,
@@ -124,23 +128,82 @@ async function refreshModelTiers(llm) {
 export function apply(ctx, config = {}) {
   const tools = ctx.get('tools')
   const llm = ctx.get('llm')
+  const mf = ctx.get('messageFeedback')
+  const timer = ctx.get('timer')
   const store = new Store(config.home || defaultHome())
+  const settleDelayMs = typeof config.settleDelayMs === 'number' ? config.settleDelayMs : SETTLE_DELAY_MS
   const policy = store.loadPolicy()
 
   const state = freshState()
   state.mode = policy.mode || config.mode || 'shadow'
   if (typeof policy.forced === 'string') state.forced = policy.forced
 
-  // 飞轮恢复：重放 rewards.jsonl 重建 UCB/LinUCB/k-NN/EXP3
+  // 飞轮恢复：重放 rewards.jsonl 重建 UCB/LinUCB/k-NN/EXP3；
+  // feedback-settle 行在基础奖励重放后按 turn 精确修正
   const rewards = store.loadJsonl('rewards.jsonl')
+  const byTurn = new Map()
   for (const rec of rewards) {
-    if (typeof rec.reward === 'number' && Array.isArray(rec.f)) applyReward(state, rec)
+    if (rec.type === 'feedback-settle') continue
+    if (typeof rec.reward === 'number' && Array.isArray(rec.f)) {
+      applyReward(state, rec)
+      byTurn.set(rec.turn, rec)
+    }
   }
+  for (const rec of rewards) {
+    if (rec.type !== 'feedback-settle') continue
+    const baseRec = byTurn.get(rec.turn)
+    if (baseRec) correctReward(state, baseRec, rec.newReward)
+  }
+  state.recByTurn = byTurn
   state.decisions = store.loadJsonl('decisions.jsonl').slice(-60)
   state.seq = state.decisions.length ? state.decisions[state.decisions.length - 1].seq : 0
 
   const log = (msg) => console.log('[agentic-router]', msg)
   if (rewards.length) log('replayed ' + rewards.length + ' rewards; ucb.total=' + state.ucb.total)
+
+  let mfWarned = false
+  // 反馈结算：对已过结算窗口的回合查询 messageFeedback，按人类 👍/👎 修正奖励
+  async function settleFeedback() {
+    if (!mf || typeof mf.list !== 'function') {
+      if (!mfWarned) { log('messageFeedback service absent — 反馈奖励停用'); mfWarned = true }
+      return
+    }
+    const tNow = now()
+    if (tNow == null) return
+    const remaining = []
+    for (const p of state.pendingFeedback) {
+      if (tNow - p.t0 < settleDelayMs) { remaining.push(p); continue }
+      try {
+        const res = await mf.list({ sessionId: p.sessionId })
+        let neg = 0
+        let pos = 0
+        if (res && res.ok === true && res.value && Array.isArray(res.value.items)) {
+          for (const it of res.value.items) {
+            if (typeof it.createdAt !== 'number' || it.createdAt < p.t0) continue
+            if (it.rating === 'negative') neg += 1
+            else if (it.rating === 'positive') pos += 1
+          }
+        }
+        const newReward = Math.max(0, Math.min(1, Math.round((p.appliedReward - 0.5 * neg + 0.1 * pos) * 100) / 100))
+        if (newReward !== p.appliedReward) {
+          const baseRec = state.recByTurn.get(p.key)
+          if (baseRec) correctReward(state, baseRec, newReward)
+          store.appendJsonl('rewards.jsonl', {
+            type: 'feedback-settle', turn: p.key, sessionId: p.sessionId,
+            negative: neg, positive: pos, applied: p.appliedReward, newReward,
+          })
+          log('feedback settle ' + p.key + ': ' + p.appliedReward + ' -> ' + newReward + ' (neg=' + neg + ' pos=' + pos + ')')
+        }
+      } catch (e) {
+        log('feedback settle failed: ' + String(e))
+      }
+    }
+    state.pendingFeedback = remaining
+  }
+
+  if (timer && typeof timer.interval === 'function') {
+    timer.interval(() => { settleFeedback().catch((e) => log('settle sweep failed: ' + String(e))) }, SWEEP_MS)
+  }
 
   // ---- 事件挂载 ----
   ctx.on('agent/pre-step', (payload, next) => {
@@ -157,6 +220,7 @@ export function apply(ctx, config = {}) {
     const cfg = await next()
     if (!cfg || typeof cfg !== 'object') return cfg
     try {
+      if (!timer || typeof timer.interval !== 'function') settleFeedback().catch(() => {})
       const key = fullKey(payload)
       if (state.turnDecision[key]) return cfg
       const pkey = agentKey(payload) + ':' + payload.turn
@@ -283,6 +347,15 @@ export function apply(ctx, config = {}) {
       }
       applyReward(state, rec)
       store.appendJsonl('rewards.jsonl', rec)
+      state.recByTurn.set(key, rec)
+      if (state.recByTurn.size > 500) {
+        const first = state.recByTurn.keys().next().value
+        if (first !== undefined) state.recByTurn.delete(first)
+      }
+      if (mf && typeof mf.list === 'function' && td.t0 != null) {
+        state.pendingFeedback.push({ key, sessionId: agentKey(payload), t0: td.t0, appliedReward: rec.reward })
+        if (state.pendingFeedback.length > 200) state.pendingFeedback.shift()
+      }
       const ak = agentKey(payload)
       if (state.openTurns.get(ak) === key) state.openTurns.delete(ak)
       log('reward ' + rec.reward + ' ' + tag + ' on ' + key + ' breakdown=' + JSON.stringify(r.breakdown))
@@ -330,6 +403,7 @@ export function apply(ctx, config = {}) {
           lin: { total: state.lin.total, tierN: state.lin.tierN, tierW: state.lin.tierW },
           knnPoolSize: state.knn.pool.length,
           exp3: state.exp3,
+          pendingFeedback: state.pendingFeedback.length,
           recentRewards: store.loadJsonl('rewards.jsonl').slice(-20),
         },
         recent: state.decisions.slice(-20),

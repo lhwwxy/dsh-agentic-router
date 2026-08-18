@@ -127,6 +127,8 @@ export function rewardOf(td, tag, dtMs) {
 
 // 把一条奖励记录应用到飞轮（UCB/LinUCB/k-NN/EXP3），replay 与实时更新共用
 export function applyReward(state, rec) {
+  // 记录本次线性更新的学习率，供反馈结算修正精确回退
+  rec.linLr = 1 / (1 + (state.lin.tierN[rec.linTier] || 0))
   const armKey = rec.clsType + ':' + rec.ucbTier
   const arm = state.ucb.arms[armKey] || (state.ucb.arms[armKey] = { n: 0, mean: 0 })
   arm.n += 1
@@ -150,4 +152,31 @@ export function applyReward(state, rec) {
       Math.exp(0.3 * (rec.reward / rec.pChosen) / rec.pool.length)
   }
   state.exp3.total += 1
+}
+
+// 反馈结算修正：把已应用奖励改为 newReward（人类在反馈窗口内点了 👍/👎 之后）
+// UCB 均值修正（n 不变）；LinUCB 用原始学习率做精确梯度回退；k-NN 追加修正经验；
+// EXP3 按乘性更新做精确逆修正。
+export function correctReward(state, rec, newReward) {
+  const delta = newReward - rec.reward
+  if (!delta) return { delta: 0 }
+
+  const arm = state.ucb.arms[rec.clsType + ':' + rec.ucbTier]
+  if (arm && arm.n > 0) arm.mean = arm.mean + delta / arm.n
+
+  const lw = state.lin.tierW[rec.linTier]
+  if (lw && Array.isArray(rec.f)) {
+    const lr = typeof rec.linLr === 'number' ? rec.linLr : 1 / (1 + (state.lin.tierN[rec.linTier] || 0))
+    for (let i = 0; i < rec.f.length; i++) lw[i] = (lw[i] || 0) + lr * delta * rec.f[i]
+  }
+
+  if (state.knn && Array.isArray(rec.f)) state.knn.pool.push({ f: rec.f, tier: rec.ucbTier, r: newReward })
+
+  if (rec.pChosen > 0 && rec.pool && rec.pool.length > 0) {
+    state.exp3.weights[rec.chosen] = (state.exp3.weights[rec.chosen] || 0) *
+      Math.exp(0.3 * delta / (rec.pChosen * rec.pool.length))
+  }
+
+  rec.reward = newReward
+  return { delta }
 }

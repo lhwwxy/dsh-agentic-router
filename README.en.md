@@ -46,7 +46,8 @@ dsh plugin --profile web add dsh-agentic-router
 Directory: `${DSH_HOME:-~/.dsh}/storages/dsh-agentic-router/` (override with `AGENTIC_ROUTER_HOME`)
 
 - `decisions.jsonl` — one line per decision: task type/complexity, all four recommendations, meta pick, actual route, swapped?
-- `rewards.jsonl` — one line per reward with breakdown (tool errors/retries/latency) + feature vector; **replayed on startup to restore learning state**
+- `rewards.jsonl` — one line per reward with breakdown (tool errors/retries/latency) + feature vector; **replayed on startup to restore learning state**; human-feedback settlements (`feedback-settle` lines) correct the replayed rewards exactly
+- Human feedback: 45s after a turn closes, the plugin polls `messageFeedback` (the Web UI 👍/👎); a thumbs-down costs −0.5, a thumbs-up adds +0.1, applied as an exact correction to the already-applied reward
 - `policy.json` — mode and forced model (atomic write)
 
 Reward: clean close starts at 1; tool failures −0.2 each (cap 0.6), model retries −0.2 each (cap 0.4), latency >30s −0.1 / >90s −0.3; errored turns score 0.
@@ -54,7 +55,8 @@ Reward: clean close starts at 1; tool failures −0.2 each (cap 0.6), model retr
 ## Known limits
 
 - Model tiers are recognized by id keywords (flash→fast, pro→strong); real swaps happen only when more than one tier exists
-- Rewards are proxies: a mediocre-but-successful answer still scores full marks, so wire up UI feedback (messageFeedback) for production use
+- Feedback settles after a 45s window (configurable via `settleDelayMs`); unsettled pending entries are lost on restart
+- Feedback only works where the deployment's Web UI actually writes it (this plugin only reads)
 - LinUCB / k-NN need dozens of turns before they graduate into the meta pool
 
 ## Development

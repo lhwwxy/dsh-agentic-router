@@ -46,7 +46,8 @@ dsh plugin --profile web add dsh-agentic-router
 目录：`${DSH_HOME:-~/.dsh}/storages/dsh-agentic-router/`（`AGENTIC_ROUTER_HOME` 可覆盖）
 
 - `decisions.jsonl` — 每条决策：任务类型/复杂度/四专家推荐/元层选择/实际路由/是否切换
-- `rewards.jsonl` — 每条奖励：明细（工具失败/重试/延迟）+ 特征向量，**重启后重放恢复学习状态**
+- `rewards.jsonl` — 每条奖励：明细（工具失败/重试/延迟）+ 特征向量，**重启后重放恢复学习状态**；人类反馈结算（`feedback-settle` 行）在重放时精确修正
+- 人类反馈：回合结束 45s 后查询 `messageFeedback`（Web UI 的 👍/👎），点踩 −0.5、点赞 +0.1，修正已应用的奖励（UCB 均值/EXP3 权重精确回退）
 - `policy.json` — 模式与强制模型（原子写）
 
 奖励公式：干净收尾 1 分起，工具失败 −0.2/次（封顶 0.6）、模型重试 −0.2/次（封顶 0.4）、延迟 >30s −0.1 / >90s −0.3；出错回合记 0。
@@ -59,7 +60,8 @@ dsh plugin --profile web add dsh-agentic-router
 ## 已知边界
 
 - 模型档位靠 id 关键词识别（flash→fast、pro→strong）；可用模型多于一档时路由才真正切换
-- 奖励信号是"代理"：任务成功但质量平庸的情况（尤其模型池内质量差距大时）仍可能被记满分，正式场景建议接入 UI 反馈（messageFeedback）
+- 反馈结算窗口 45s（可配置 `settleDelayMs`），窗口内无反馈按代理奖励结算；重启会丢失未结算的 pending 条目
+- 反馈依赖部署的 Web UI 实际产生数据（本插件只读取，不写入）
 - 毕业策略（LinUCB/k-NN）需要数十个回合样本才会进元层池
 
 ## 开发

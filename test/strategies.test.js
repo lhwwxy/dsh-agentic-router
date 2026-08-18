@@ -4,7 +4,7 @@ import assert from 'node:assert/strict'
 import {
   tierOf, tierTarget, resolveTier,
   recommendRule, recommendUcb, recommendLin, recommendKnn,
-  rewardOf, applyReward,
+  rewardOf, applyReward, correctReward,
 } from '../dsh/strategies.js'
 import { metaPick, DEFAULT_WEIGHTS } from '../dsh/meta.js'
 
@@ -118,4 +118,42 @@ test('k-NN 推荐：邻居经验按均值选档', () => {
   const r = recommendKnn({ type: 'qa' }, f, { pool })
   assert.equal(r.tier, 'strong')
   assert.ok(r.conf > 0)
+})
+
+test('correctReward：反馈修正精确回退 UCB 均值与 EXP3 权重', () => {
+  const state = {
+    ucb: { total: 1, arms: {} },
+    lin: { total: 1, tierN: { fast: 1, mid: 0, strong: 0 }, tierW: { fast: new Array(9).fill(0), mid: new Array(9).fill(0), strong: new Array(9).fill(0) } },
+    knn: { pool: [] },
+    exp3: { total: 1, weights: { ...DEFAULT_WEIGHTS } },
+  }
+  const rec = {
+    reward: 1, clsType: 'qa', ucbTier: 'fast', linTier: 'fast',
+    f: [1, 0.1, 0.01, 0, 0, 0, 0, 0, 1],
+    chosen: 'rule', pChosen: 0.7, pool: ['ucb', 'rule'],
+  }
+  applyReward(state, rec)
+  assert.equal(state.ucb.arms['qa:fast'].mean, 1)
+  const wBefore = state.exp3.weights.rule
+
+  correctReward(state, rec, 0.5)
+  assert.equal(state.ucb.arms['qa:fast'].n, 1, 'n 不变')
+  assert.equal(state.ucb.arms['qa:fast'].mean, 0.5, '均值修正为 0.5')
+  assert.ok(state.exp3.weights.rule < wBefore, 'EXP3 权重应乘性回退')
+  assert.ok(Math.abs(state.exp3.weights.rule - DEFAULT_WEIGHTS.rule * Math.exp(0.3 * (0.5 / 0.7) / 2)) < 1e-9, 'EXP3 回退为精确逆运算')
+  assert.equal(rec.reward, 0.5, '记录同步更新')
+})
+
+test('correctReward：无变化时不修正', () => {
+  const state = {
+    ucb: { total: 1, arms: {} },
+    lin: { total: 1, tierN: { fast: 1, mid: 0, strong: 0 }, tierW: { fast: new Array(9).fill(0), mid: new Array(9).fill(0), strong: new Array(9).fill(0) } },
+    knn: { pool: [] },
+    exp3: { total: 1, weights: { ...DEFAULT_WEIGHTS } },
+  }
+  const rec = { reward: 0.8, clsType: 'qa', ucbTier: 'fast', linTier: 'fast', f: [1, 0, 0, 0, 0, 0, 0, 0, 1], chosen: 'rule', pChosen: 0.7, pool: ['ucb', 'rule'] }
+  applyReward(state, rec)
+  const snapshot = JSON.stringify(state.ucb)
+  correctReward(state, rec, 0.8)
+  assert.equal(JSON.stringify(state.ucb), snapshot)
 })
