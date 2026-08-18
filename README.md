@@ -22,7 +22,7 @@ DeepSeek Harness（DSH）插件：**学习型智能路由（agentic router）+ �
 | k-NN | 经验池最近邻（k=5）聚合 | 影子，30 经验毕业 |
 | EXP3 | 元选择器，重要性加权更新 | 常驻，冷启动偏 rule（权重 2.5） |
 
-设计细节与路线图见 [docs/DESIGN.md](./docs/DESIGN.md)。本实现源自真实运行时上的动态原型验证（8 个实测缺陷已修复并固化为回归测试）。
+设计细节与路线图见 [docs/DESIGN.md](./docs/DESIGN.md)。
 
 ## 安装
 
@@ -80,15 +80,7 @@ dsh plugin --profile web add dsh-agentic-router
 - 反馈依赖部署的 Web UI 实际产生数据（本插件只读取，不写入）
 - 毕业策略（LinUCB/k-NN）需要数十个回合样本才会进元层池
 
-## 开发
-
-```sh
-npm test        # node --test，零依赖
-```
-
-回归用例覆盖实测缺陷：qa 祈使句、mid 档回退、UCB 冷启动轮转、agent 键隔离、奖励 JSON 合法性、飞轮重放恢复等。
-
-**维护者（发布流程、分支保护、CI 发布配置）请见 [docs/MAINTAINING.md](./docs/MAINTAINING.md)。**
+**开发、测试与发布流程（维护者）见 [docs/MAINTAINING.md](./docs/MAINTAINING.md)。**
 
 ## License
 

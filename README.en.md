@@ -78,13 +78,7 @@ the `agentic_router_set_prices` tool (persisted to policy.json) or at install vi
 - Feedback only works where the deployment's Web UI actually writes it (this plugin only reads)
 - LinUCB / k-NN need dozens of turns before they graduate into the meta pool
 
-## Development
-
-```sh
-npm test        # node --test, zero dependencies
-```
-
-**Maintainers (release flow, branch protection, CI publish setup): see [docs/MAINTAINING.md](./docs/MAINTAINING.md).**
+**Development, testing and release flow (maintainers): see [docs/MAINTAINING.md](./docs/MAINTAINING.md).**
 
 ## License
 
