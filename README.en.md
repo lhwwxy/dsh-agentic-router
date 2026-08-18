@@ -84,12 +84,26 @@ the `agentic_router_set_prices` tool (persisted to policy.json) or at install vi
 npm test        # node --test, zero dependencies
 ```
 
-## Publish
+## Publish (recommended: branch + CI gate + tag + npm)
+
+> Don't push straight to main: main doubles as the `github:` install source and the
+> directory's documentation source, so a bad commit instantly affects every direct
+> installer. npm versions are immutable and precisely rollback-able — treat npm as
+> the real release gate.
+
+1. **Feature branches + PRs**: enable branch protection on main (require the `ci`
+   status check), merge only when green
+2. **Tag-triggered release**: `npm version patch` (creates a `vX.Y.Z` tag + commit);
+   CI tests and `npm publish`es on tags (set the `NPM_TOKEN` secret — an npm
+   Automation token)
+3. **Push**: `git push origin main --follow-tags`
+4. **npm is the primary install channel**: `dsh plugin add dsh-agentic-router`
+   installs an immutable npm version; GitHub main is a source mirror and preview only
 
 ```sh
-npm publish                                     # requires npm account
-git push origin main                            # after making the GitHub repo public
-# directory listing: add the dsh-plugin topic, or submit at dshmarketplace.dev/submit
+# Example: release a patch
+npm version patch          # bump version + create tag
+git push origin main --follow-tags   # CI tests and publishes to npm
 ```
 
 ## License

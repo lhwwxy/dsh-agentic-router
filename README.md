@@ -88,12 +88,20 @@ npm test        # node --test，零依赖
 
 回归用例覆盖实测缺陷：qa 祈使句、mid 档回退、UCB 冷启动轮转、agent 键隔离、奖励 JSON 合法性、飞轮重放恢复等。
 
-## 发布
+## 发布（推荐流程：分支 + CI 门禁 + tag + npm）
+
+> 不要直接往 main 推代码：main 同时是 `github:` 安装源与目录站文档源，坏提交会立即影响
+> 所有直接安装者。npm 版本不可变、可精确回滚，才是正式发布门禁。
+
+1. **功能分支 + PR**：main 建议开启分支保护（要求 `ci` 状态检查通过），PR 绿了再合并
+2. **tag 触发发布**：合并后 `npm version patch`（自动打 `vX.Y.Z` tag 并提交），CI 在 tag 上自动跑测试并 `npm publish`（仓库 Secrets 配置 `NPM_TOKEN`，用 npm 的 Automation 类型令牌）
+3. **推送**：`git push origin main --follow-tags`
+4. **安装主渠道是 npm**：`dsh plugin add dsh-agentic-router` 装的是版本不可变的 npm 包；GitHub main 仅供源码镜像与尝鲜
 
 ```sh
-npm publish                                     # 需 npm 账号
-git push origin main                            # GitHub 仓库公开后
-# 目录站：给仓库加 dsh-plugin topic 自动收录，或到 dshmarketplace.dev/submit 提交
+# 示例：发布一个补丁版
+npm version patch          # bump 版本 + 打 tag
+git push origin main --follow-tags   # CI 自动测试并发布 npm
 ```
 
 ## License
