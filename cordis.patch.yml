@@ -1,0 +1,4 @@
+# dsh bundle 层：挂载 dsh-agentic-router 插件（dsh/index.js，经 package.json exports）
+- insert:
+    - id: agentic-router
+      name: 'dsh-agentic-router'
