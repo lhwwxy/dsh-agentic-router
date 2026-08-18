@@ -515,15 +515,15 @@ export function apply(ctx, config = {}) {
         provider: { type: 'string', description: 'provider id，如 openai、anthropic、deepseek-official' },
         model: { type: 'string', description: '可选：精确模型 id；省略则设置该 provider 的档位价' },
         tier: { type: 'string', enum: ['fast', 'mid', 'strong'], description: '档位（未给 model 时必填）' },
-        priceIn: { type: 'number', minimum: 0, description: '输入价（元/百万 tokens）' },
-        priceOut: { type: 'number', minimum: 0, description: '输出价（元/百万 tokens）' },
+        priceIn: { type: 'number', description: '输入价（元/百万 tokens），负数视为查询模式' },
+        priceOut: { type: 'number', description: '输出价（元/百万 tokens），负数视为查询模式' },
       },
       required: ['provider'],
     },
     output: OUT('agentic router 价格表'),
     isConcurrencySafe: () => true,
     async execute(args) {
-      if (typeof args.priceIn !== 'number' || typeof args.priceOut !== 'number') {
+      if (typeof args.priceIn !== 'number' || typeof args.priceOut !== 'number' || args.priceIn < 0 || args.priceOut < 0) {
         return { prices, note: '查看模式：传 priceIn/priceOut 与 model 或 tier 进行设置' }
       }
       const byProvider = prices[args.provider] || (prices[args.provider] = {})
