@@ -40,6 +40,7 @@ dsh plugin --profile web add dsh-agentic-router
 | `agentic_router_set_mode` | shadow (default) / active (real swaps) / off (bypass) |
 | `agentic_router_force` | force a model id (active mode only); clear=true to release |
 | `agentic_router_reset` | wipe flywheel learning state, keep mode |
+| `agentic_router_set_prices` | set/query per-provider per-model (or per-tier) prices |
 
 ## Data flywheel (persistence)
 
@@ -55,12 +56,19 @@ Reward: clean close starts at 1; tool failures −0.2 each (cap 0.6), model retr
 
 **Cost signal (token billing)**: the plugin wraps `llm/stream` and accumulates each model
 call's `usage` chunk (input/output/cache-read/reasoning tokens); providers without usage
-fall back to length-based estimates (flagged `estimated`). Default price table follows
-DeepSeek's official pricing (CNY per million tokens), overridable:
+fall back to length-based estimates (flagged `estimated`).
+
+**Three-level price resolution** (CNY per million tokens): `provider→model` exact price >
+`provider→tier` price > `*` generic tier > conservative fallback. **Unknown providers
+never inherit DeepSeek pricing** — they use the generic tier and carry a `pricingSource`
+audit field. DeepSeek's official pricing ships as default; add other models at runtime via
+the `agentic_router_set_prices` tool (persisted to policy.json) or at install via
+`config.prices`:
 
 ```js
-// config.prices / config.costWeight / config.costCap
-{ fast: { in: 0.2, out: 2 }, mid: { in: 0.5, out: 6 }, strong: { in: 1, out: 12 } }
+{ 'deepseek-official': { 'deepseek-v4-pro': { in: 1, out: 12 } },
+  openai: { 'gpt-x-pro': { in: 15, out: 60 } },
+  '*': { fast: { in: 1, out: 4 }, mid: { in: 2, out: 8 }, strong: { in: 3, out: 16 } } }
 ```
 
 ## Known limits

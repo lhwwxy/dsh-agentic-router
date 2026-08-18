@@ -40,6 +40,7 @@ dsh plugin --profile web add dsh-agentic-router
 | `agentic_router_set_mode` | 切换 shadow（默认）/ active（真切换）/ off（旁路） |
 | `agentic_router_force` | 强制指定模型 id（active 生效），clear=true 清除 |
 | `agentic_router_reset` | 清空飞轮学习状态，保留模式 |
+| `agentic_router_set_prices` | 配置/查询某 provider 某模型（或档位）的价格 |
 
 ## 数据飞轮（落盘）
 
@@ -55,11 +56,16 @@ dsh plugin --profile web add dsh-agentic-router
 
 **成本信号（token 计费）**：透传 `llm/stream`，累加每个模型调用的 `usage` chunk
 （输入/输出/缓存读/推理 token）；无 usage 的 provider 按文本长度估算（标 `estimated`）。
-价格表默认 DeepSeek 官方口径（元/百万 token），可配置：
+
+**价格表三级解析**（元/百万 token）：`provider→model` 精确价 > `provider→档位` 价 >
+`*` 通用档位 > 保守兜底。**未知 provider 绝不套用 DeepSeek 价格**，用通用档位并标记
+`pricingSource`（审计字段）。默认含 DeepSeek 官方口径，接入其他模型用
+`agentic_router_set_prices` 工具配价（持久化到 policy.json），或安装时传 `config.prices`：
 
 ```js
-// config.prices / config.costWeight / config.costCap
-{ fast: { in: 0.2, out: 2 }, mid: { in: 0.5, out: 6 }, strong: { in: 1, out: 12 } }
+{ 'deepseek-official': { 'deepseek-v4-pro': { in: 1, out: 12 } },
+  openai: { 'gpt-x-pro': { in: 15, out: 60 } },
+  '*': { fast: { in: 1, out: 4 }, mid: { in: 2, out: 8 }, strong: { in: 3, out: 16 } } }
 ```
 
 ## 分类器（规则先验，<1ms）

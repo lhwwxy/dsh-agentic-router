@@ -5,7 +5,7 @@ import {
   tierOf, tierTarget, resolveTier,
   recommendRule, recommendUcb, recommendLin, recommendKnn,
   rewardOf, applyReward, correctReward,
-  DEFAULT_PRICES, turnCostYuan,
+  DEFAULT_PRICES, turnCostYuan, resolvePrice,
 } from '../dsh/strategies.js'
 import { metaPick, DEFAULT_WEIGHTS } from '../dsh/meta.js'
 
@@ -159,15 +159,26 @@ test('correctReward：无变化时不修正', () => {
   assert.equal(JSON.stringify(state.ucb), snapshot)
 })
 
-test('turnCostYuan：按档位价格表计算（缓存读计入输入、推理计入输出）', () => {
+test('turnCostYuan：三级价格解析（缓存读计入输入、推理计入输出）', () => {
   const usage = { inputTokens: 1000, outputTokens: 100, cacheReadTokens: 500, reasoningTokens: 50 }
-  // fast: (1500×0.2 + 150×2)/1e6 = 0.0006
-  assert.ok(Math.abs(turnCostYuan(usage, 'fast', DEFAULT_PRICES) - 0.0006) < 1e-9)
-  // strong: (1500×1 + 150×12)/1e6 = 0.0033
-  assert.ok(Math.abs(turnCostYuan(usage, 'strong', DEFAULT_PRICES) - 0.0033) < 1e-9)
-  assert.equal(turnCostYuan(null, 'fast', DEFAULT_PRICES), 0)
-  // 自定义价格表覆盖
-  assert.equal(turnCostYuan({ inputTokens: 1e6, outputTokens: 0 }, 'fast', { fast: { in: 3, out: 5 } }), 3)
+  // 1) 精确模型价：deepseek-v4-pro = (1500×1 + 150×12)/1e6 = 0.0033
+  assert.ok(Math.abs(turnCostYuan(usage, 'deepseek-official', 'deepseek-v4-pro', 'strong', DEFAULT_PRICES) - 0.0033) < 1e-9)
+  // 2) provider 档位价：acme/xyz-pro 无精确价 → acme.strong = (1500×5 + 150×50)/1e6 = 0.015
+  const acme = { acme: { strong: { in: 5, out: 50 } } }
+  assert.ok(Math.abs(turnCostYuan(usage, 'acme', 'xyz-pro', 'strong', acme) - 0.015) < 1e-9)
+  // 3) 未知 provider 用 '*' 通用档位（绝不套用 DeepSeek 价）：'*'.fast = (1500×1 + 150×4)/1e6 = 0.0021
+  assert.ok(Math.abs(turnCostYuan(usage, 'mystery', 'some-model', 'fast', DEFAULT_PRICES) - 0.0021) < 1e-9)
+  // 4) 连 '*' 都没有 → 保守兜底 (3,16) = (1500×3 + 150×16)/1e6 = 0.0069
+  assert.ok(Math.abs(turnCostYuan(usage, 'mystery', 'some-model', 'fast', {}) - 0.0069) < 1e-9)
+  assert.equal(turnCostYuan(null, 'deepseek-official', 'deepseek-v4-pro', 'strong', DEFAULT_PRICES), 0)
+})
+
+test('resolvePrice 返回来源标注（透明审计）', () => {
+  const acme = { acme: { strong: { in: 5, out: 50 } } }
+  assert.equal(resolvePrice('deepseek-official', 'deepseek-v4-pro', 'strong', DEFAULT_PRICES).source, 'provider-model')
+  assert.equal(resolvePrice('acme', 'xyz-pro', 'strong', acme).source, 'provider-tier')
+  assert.equal(resolvePrice('mystery', 'some-model', 'fast', DEFAULT_PRICES).source, 'generic-tier')
+  assert.equal(resolvePrice('mystery', 'some-model', 'fast', {}).source, 'unknown-conservative')
 })
 
 test('rewardOf 成本项：weight×元封顶 cap', () => {

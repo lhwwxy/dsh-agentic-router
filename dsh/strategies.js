@@ -106,28 +106,50 @@ export function recommendKnn(cls, f, knnState) {
 }
 
 // ---- 成本信号（token 计费） ----
-// 默认价格表：DeepSeek 官方口径（元/百万 tokens），可按 config.prices 覆盖
+// 价格表（元/百万 tokens）三级解析：
+//   1) prices[provider][model]          精确模型价（最高优先）
+//   2) prices[provider][tier]           该 provider 的档位价
+//   3) prices['*'][tier]                通用档位兜底（未知 provider 不套用 DeepSeek 价）
+//   4) CONSERVATIVE                     保守值 + 标记 unknown，提醒用户补价格
 export const DEFAULT_PRICES = {
-  fast: { in: 0.2, out: 2 },
-  mid: { in: 0.5, out: 6 },
-  strong: { in: 1, out: 12 },
+  'deepseek-official': {
+    'deepseek-v4-flash': { in: 0.2, out: 2 },
+    'deepseek-v4-pro': { in: 1, out: 12 },
+  },
+  '*': {
+    fast: { in: 1, out: 4 },
+    mid: { in: 2, out: 8 },
+    strong: { in: 3, out: 16 },
+  },
+}
+
+const CONSERVATIVE = { in: 3, out: 16 }
+
+// 解析价格并返回来源（透明标注：价格到底从哪来的）
+export function resolvePrice(provider, model, tier, prices) {
+  const table = prices || DEFAULT_PRICES
+  const byProvider = table[provider]
+  if (byProvider && byProvider[model]) return { price: byProvider[model], source: 'provider-model' }
+  if (byProvider && byProvider[tier]) return { price: byProvider[tier], source: 'provider-tier' }
+  const generic = table['*']
+  if (generic && generic[tier]) return { price: generic[tier], source: 'generic-tier' }
+  return { price: CONSERVATIVE, source: 'unknown-conservative' }
 }
 
 // 单回合成本（元）：缓存读计入输入，推理 token 计入输出
-export function turnCostYuan(usage, tier, prices) {
+export function turnCostYuan(usage, provider, model, tier, prices) {
   if (!usage) return 0
-  const table = prices || DEFAULT_PRICES
-  const p = table[tier] || table.mid || DEFAULT_PRICES.mid
+  const { price } = resolvePrice(provider, model, tier, prices)
   const input = (usage.inputTokens || 0) + (usage.cacheReadTokens || 0)
   const output = (usage.outputTokens || 0) + (usage.reasoningTokens || 0)
-  return (p.in * input + p.out * output) / 1e6
+  return (price.in * input + price.out * output) / 1e6
 }
 
 // 质量代理奖励：干净收尾 1 分起，扣工具失败(0.2/次，封顶 0.6)、模型重试(0.2/次，封顶 0.4)、
 // 延迟(>90s −0.3, >30s −0.1)、成本(min(cap, weight × 元)，默认 weight=20 即每 0.01 元 −0.2)
 export function rewardOf(td, tag, dtMs) {
   if (tag !== 'clean-close') {
-    return { reward: 0, breakdown: { base: 0, toolErrors: td.toolErrors || 0, retries: td.retries || 0, dtMs, costYuan: td.costYuan || 0, costPenalty: 0 } }
+    return { reward: 0, breakdown: { base: 0, toolErrors: td.toolErrors || 0, retries: td.retries || 0, dtMs, costYuan: td.costYuan || 0, costPenalty: 0, pricingSource: td.pricingSource || 'n/a' } }
   }
   let reward = 1
   const toolPenalty = Math.min(0.6, 0.2 * (td.toolErrors || 0))
@@ -145,7 +167,7 @@ export function rewardOf(td, tag, dtMs) {
   }
   return {
     reward: Math.max(0, Math.round(reward * 100) / 100),
-    breakdown: { base: 1, toolErrors: td.toolErrors || 0, toolPenalty, retries: td.retries || 0, retryPenalty, costYuan, costPenalty, dtMs },
+    breakdown: { base: 1, toolErrors: td.toolErrors || 0, toolPenalty, retries: td.retries || 0, retryPenalty, costYuan, costPenalty, dtMs, pricingSource: td.pricingSource || 'n/a' },
   }
 }
 

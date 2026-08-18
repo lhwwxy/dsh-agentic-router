@@ -16,7 +16,7 @@ import {
   tierOf, tierTarget, resolveTier,
   recommendRule, recommendUcb, recommendLin, recommendKnn,
   rewardOf, applyReward, correctReward,
-  DEFAULT_PRICES, turnCostYuan,
+  DEFAULT_PRICES, turnCostYuan, resolvePrice,
 } from './strategies.js'
 import { metaPick, DEFAULT_WEIGHTS } from './meta.js'
 import { Store, defaultHome } from './store.js'
@@ -133,10 +133,10 @@ export function apply(ctx, config = {}) {
   const timer = ctx.get('timer')
   const store = new Store(config.home || defaultHome())
   const settleDelayMs = typeof config.settleDelayMs === 'number' ? config.settleDelayMs : SETTLE_DELAY_MS
-  const prices = config.prices || DEFAULT_PRICES
+  const policy = store.loadPolicy()
+  let prices = (policy.prices && Object.keys(policy.prices).length) ? policy.prices : (config.prices || DEFAULT_PRICES)
   const costWeight = typeof config.costWeight === 'number' ? config.costWeight : 20
   const costCap = typeof config.costCap === 'number' ? config.costCap : 0.5
-  const policy = store.loadPolicy()
 
   const state = freshState()
   state.mode = policy.mode || config.mode || 'shadow'
@@ -277,7 +277,7 @@ export function apply(ctx, config = {}) {
       state.turnDecision[key] = {
         clsType: cls.type, f, recs, meta, chosen: meta.chosen,
         finalized: false, t0: now(), toolErrors: 0, retries: 0,
-        currentModel: current, costWeight, costCap,
+        currentModel: current, provider, costWeight, costCap,
         estInputTokens: Math.ceil(text.length / 1.5),
       }
       state.openTurns.set(agentKey(payload), key)
@@ -343,9 +343,13 @@ export function apply(ctx, config = {}) {
               u.estimated = true
             }
             td.usage = u
-            const tier = tierOf(typeof td.currentModel === 'string' ? td.currentModel : '')
-            td.costYuan = turnCostYuan(u, tier, prices)
-            log('usage on ' + key + ': in=' + u.inputTokens + ' out=' + u.outputTokens + (u.estimated ? ' (估)' : '') + ' cost=¥' + td.costYuan.toFixed(4))
+            const model = typeof td.currentModel === 'string' ? td.currentModel : ''
+            const tier = tierOf(model)
+            const provider = (options && typeof options.provider === 'string' && options.provider) || td.provider || ''
+            const rp = resolvePrice(provider, model, tier, prices)
+            td.costYuan = turnCostYuan(u, provider, model, tier, prices)
+            td.pricingSource = rp.source
+            log('usage on ' + key + ': in=' + u.inputTokens + ' out=' + u.outputTokens + (u.estimated ? ' (估)' : '') + ' cost=¥' + td.costYuan.toFixed(4) + ' [' + rp.source + ']')
           }
         } catch (e) {
           log('usage hook failed: ' + String(e))
@@ -446,12 +450,14 @@ export function apply(ctx, config = {}) {
         forcedModel: state.forced,
         totalDecisions: state.seq,
         modelTiers: state.modelTiers,
+        prices,
         flywheel: {
           ucb: state.ucb,
           lin: { total: state.lin.total, tierN: state.lin.tierN, tierW: state.lin.tierW },
           knnPoolSize: state.knn.pool.length,
           exp3: state.exp3,
           pendingFeedback: state.pendingFeedback.length,
+          prices,
           recentRewards: store.loadJsonl('rewards.jsonl').slice(-20),
         },
         recent: state.decisions.slice(-20),
@@ -470,7 +476,7 @@ export function apply(ctx, config = {}) {
     isConcurrencySafe: () => true,
     async execute(args) {
       state.mode = args.mode
-      store.savePolicy({ mode: state.mode, forced: state.forced })
+      store.savePolicy({ mode: state.mode, forced: state.forced, prices })
       return { mode: state.mode }
     },
   })
@@ -489,15 +495,43 @@ export function apply(ctx, config = {}) {
     async execute(args) {
       if (args && args.clear) {
         state.forced = null
-        store.savePolicy({ mode: state.mode, forced: null })
+        store.savePolicy({ mode: state.mode, forced: null, prices })
         return { forced: null }
       }
       if (args && typeof args.model === 'string') {
         state.forced = args.model
-        store.savePolicy({ mode: state.mode, forced: args.model })
+        store.savePolicy({ mode: state.mode, forced: args.model, prices })
         return { forced: args.model }
       }
       return { forced: state.forced, error: '需要 model 或 clear=true' }
+    },
+  })
+  register({
+    name: 'agentic_router_set_prices',
+    description: '配置/查询某 provider 某模型（或档位）的价格（元/百万 tokens，{in, out}）。不带 priceIn/priceOut 时返回当前价格表。接入新模型后用它补价格，未知价格按保守值估算并标记 unknown。',
+    parameters: {
+      type: 'object',
+      properties: {
+        provider: { type: 'string', description: 'provider id，如 openai、anthropic、deepseek-official' },
+        model: { type: 'string', description: '可选：精确模型 id；省略则设置该 provider 的档位价' },
+        tier: { type: 'string', enum: ['fast', 'mid', 'strong'], description: '档位（未给 model 时必填）' },
+        priceIn: { type: 'number', minimum: 0, description: '输入价（元/百万 tokens）' },
+        priceOut: { type: 'number', minimum: 0, description: '输出价（元/百万 tokens）' },
+      },
+      required: ['provider'],
+    },
+    output: OUT('agentic router 价格表'),
+    isConcurrencySafe: () => true,
+    async execute(args) {
+      if (typeof args.priceIn !== 'number' || typeof args.priceOut !== 'number') {
+        return { prices, note: '查看模式：传 priceIn/priceOut 与 model 或 tier 进行设置' }
+      }
+      const byProvider = prices[args.provider] || (prices[args.provider] = {})
+      if (args.model) byProvider[args.model] = { in: args.priceIn, out: args.priceOut }
+      else if (args.tier) byProvider[args.tier] = { in: args.priceIn, out: args.priceOut }
+      else return { error: '需要 model 或 tier', prices }
+      store.savePolicy({ mode: state.mode, forced: state.forced, prices })
+      return { prices, updated: args.model || (args.provider + '/' + args.tier) }
     },
   })
   register({

@@ -52,7 +52,7 @@ test('端到端：shadow 记录不切换 → active 按元选择切换 → 奖�
   const pre = ctx.listeners['agent/pre-step']
   const stop = ctx.listeners['agent/turn-stopping']
   assert.ok(req && pre && stop, '事件监听应全部挂载')
-  assert.equal(ctx.registered.length, 4, '应注册 4 个工具')
+  assert.equal(ctx.registered.length, 5, '应注册 5 个工具')
 
   const nextPro = async () => ({ provider: 'deepseek-official', model: 'deepseek-v4-pro' })
 
@@ -210,7 +210,7 @@ test('成本信号：llm/stream 透传并累加 usage，奖励按成本扣分', 
 
   // 模拟一次流式调用：文本 + usage chunk（strong 档 100k 输入 100k 输出）
   const chunks = []
-  const wrapped = stream({ sessionId: 's1' }, async function* () {
+  const wrapped = stream({ sessionId: 's1', provider: 'deepseek-official' }, async function* () {
     yield { type: 'text-delta', text: '月球' }
     yield { type: 'usage', usage: { inputTokens: 100000, outputTokens: 100000 } }
   })
@@ -238,7 +238,7 @@ test('成本信号：无 usage 的 provider 走估算兜底（estimated 标记�
 
   await pre({ ...payload('s1', 1), messages: [{ content: [{ type: 'text', text: QA_TASK }] }] }, async () => ({}))
   await req(payload('s1', 1), async () => ({ provider: 'deepseek-official', model: 'deepseek-v4-pro' }))
-  const wrapped = stream({ sessionId: 's1' }, async function* () {
+  const wrapped = stream({ sessionId: 's1', provider: 'deepseek-official' }, async function* () {
     yield { type: 'text-delta', text: 'H2O' }
     yield { type: 'finish', reason: 'stop' }
   })
@@ -247,4 +247,60 @@ test('成本信号：无 usage 的 provider 走估算兜底（estimated 标记�
   const rewards = new Store(home).loadJsonl('rewards.jsonl')
   assert.ok(rewards[0].breakdown.costYuan > 0, '估算成本应 > 0')
   assert.ok(rewards[0].breakdown.costYuan < 0.01, '小回合成本应很小')
+})
+
+test('set_prices：接入新 provider 后配置价格，成本按新价计算', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-router-price-'))
+  const ctx = mockCtx({})
+  apply(ctx, { home })
+  const setPrices = ctx.registered.find((t) => t.name === 'agentic_router_set_prices')
+  const stats = ctx.registered.find((t) => t.name === 'agentic_router_stats')
+
+  // 默认无 openai 精确价 → 查询显示 prices 表
+  const view = await setPrices.execute({ provider: 'openai' }, {})
+  assert.ok(view.prices['*'], '默认含通用档位兜底')
+
+  // 配置 openai/gpt-x-pro 价格
+  const r = await setPrices.execute({ provider: 'openai', model: 'gpt-x-pro', priceIn: 15, priceOut: 60 }, {})
+  assert.equal(r.updated, 'gpt-x-pro')
+  const after = await stats.execute({}, {})
+  assert.equal(after.prices.openai['gpt-x-pro'].out, 60, '价格表热更新')
+
+  // 新 provider 决策 + 流式 usage → 成本按 15/60 计
+  const req = ctx.listeners['agent/request']
+  const pre = ctx.listeners['agent/pre-step']
+  const stop = ctx.listeners['agent/turn-stopping']
+  const stream = ctx.listeners['llm/stream']
+  await pre({ ...payload('s1', 1), messages: [{ content: [{ type: 'text', text: CODE_TASK }] }] }, async () => ({}))
+  await req(payload('s1', 1), async () => ({ provider: 'openai', model: 'gpt-x-pro' }))
+  const wrapped = stream({ sessionId: 's1', provider: 'openai' }, async function* () {
+    yield { type: 'usage', usage: { inputTokens: 1000, outputTokens: 1000 } }
+  })
+  for await (const c of wrapped) { /* 透传 */ }
+  await stop(payload('s1', 1))
+  const rewards = new Store(home).loadJsonl('rewards.jsonl')
+  // (1000×15 + 1000×60)/1e6 = 0.075 元；来源 provider-model
+  assert.ok(Math.abs(rewards[0].breakdown.costYuan - 0.075) < 1e-9)
+  assert.equal(rewards[0].breakdown.pricingSource, 'provider-model')
+})
+
+test('未知 provider 不套用 DeepSeek 价格：用通用档位并标记来源', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-router-unknown-'))
+  const ctx = mockCtx({})
+  apply(ctx, { home })
+  const req = ctx.listeners['agent/request']
+  const pre = ctx.listeners['agent/pre-step']
+  const stop = ctx.listeners['agent/turn-stopping']
+  const stream = ctx.listeners['llm/stream']
+  await pre({ ...payload('s1', 1), messages: [{ content: [{ type: 'text', text: QA_TASK }] }] }, async () => ({}))
+  await req(payload('s1', 1), async () => ({ provider: 'mystery-vendor', model: 'mystery-fast' }))
+  const wrapped = stream({ sessionId: 's1', provider: 'mystery-vendor' }, async function* () {
+    yield { type: 'usage', usage: { inputTokens: 1000, outputTokens: 1000 } }
+  })
+  for await (const c of wrapped) { /* 透传 */ }
+  await stop(payload('s1', 1))
+  const rewards = new Store(home).loadJsonl('rewards.jsonl')
+  // '*' fast = (1000×1 + 1000×4)/1e6 = 0.005
+  assert.ok(Math.abs(rewards[0].breakdown.costYuan - 0.005) < 1e-9)
+  assert.equal(rewards[0].breakdown.pricingSource, 'generic-tier')
 })
