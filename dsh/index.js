@@ -38,6 +38,22 @@ const KNN_GRADUATION = 30   // k-NN 毕业经验线
 const SETTLE_DELAY_MS = 45000 // 反馈结算窗口：回合结束 45s 后查询 messageFeedback
 const SWEEP_MS = 15000        // 结算轮询周期
 
+// 同步兜底档位表：从 DEFAULT_PRICES 已知的 provider→model 推导档位，
+// 让插件在 llm.listModels 异步加载完成之前也能立即决策与切换（不 await、不延期）。
+// 加载完成后由 refreshModelTiers 用权威目录覆盖。
+function fallbackTiers() {
+  const tiers = { fast: [], mid: [], strong: [] }
+  const providers = []
+  for (const provider of Object.keys(DEFAULT_PRICES)) {
+    if (provider === '*') continue
+    const models = Object.keys(DEFAULT_PRICES[provider] || {})
+    if (!models.length) continue
+    providers.push({ provider, models })
+    for (const n of models) tiers[tierOf(n)].push(provider + '/' + n)
+  }
+  return { providers, tiers }
+}
+
 function freshState() {
   return {
     mode: 'shadow',
@@ -45,7 +61,7 @@ function freshState() {
     decisions: [],
     forced: null,
     pending: new Map(),
-    modelTiers: null,
+    modelTiers: fallbackTiers(),
     turnDecision: {},
     openTurns: new Map(),
     pendingFeedback: [],
@@ -287,11 +303,9 @@ export function apply(ctx, config = {}) {
 
   // ---- 决策流水线（inbox 与 request 兜底共用） ----
   // 返回 { key, td, record, target }；已决策过本回合则返回 null。
-  // 档位表异步加载；决策前等待就绪（tiers-not-ready 会拿不到 target）。
-  async function decideAndRecord(payload, text, current, provider, source) {
-    if (!state.modelTiers) {
-      try { await tiersReady } catch (e) { /* keep null */ }
-    }
+  // 必须同步执行：档位表用 fallbackTiers() 兜底（见 freshState），
+  // 不 await、不延期——否则追加 header 会落到 prompt 组装之后，被 loop 覆盖。
+  function decideAndRecord(payload, text, current, provider, source) {
     const key = fullKey(payload)
     if (state.turnDecision[key]) return null
     const cls = classify(text)
@@ -377,14 +391,14 @@ export function apply(ctx, config = {}) {
   // ---- 事件挂载 ----
   // 回合开始（prompt 组装之前）：捕获用户消息并决策，active 模式立即应用切换。
   // 这是主路径——零延迟，回合第一步就按目标模型执行。
-  ctx.on('agent/inbox/claimed', async (payload) => {
+  ctx.on('agent/inbox/claimed', (payload) => {
     try {
       const session = sessionOf(payload)
       const text = extractText(payload && payload.message)
       if (!text) return
       const current = session ? currentModel(session) : null
       const provider = session ? currentProvider(session) : ''
-      const r = await decideAndRecord(payload, text, current, provider, 'inbox')
+      const r = decideAndRecord(payload, text, current, provider, 'inbox')
       if (!r) return
       applyDecision(session, r.key, r.td, r.record, r.target)
       commitRecord(r.record)
@@ -428,7 +442,7 @@ export function apply(ctx, config = {}) {
       const text = state.pending.get(pkey) || ''
       state.pending.delete(pkey)
       const provider = typeof cfg.provider === 'string' ? cfg.provider : ''
-      const r = await decideAndRecord(payload, text, model, provider, 'request')
+      const r = decideAndRecord(payload, text, model, provider, 'request')
       if (r) {
         r.td.needsApply = state.mode === 'active' && r.target && r.target !== r.td.currentModel
         commitRecord(r.record)
@@ -571,10 +585,11 @@ export function apply(ctx, config = {}) {
   ctx.on('agent/turn-stopping', (payload) => finalize(payload, 'clean-close'))
   ctx.on('agent/error', (payload) => finalize(payload, 'error'))
 
-  // 档位表异步加载；decideAndRecord 在决策前 await 此 promise
+  // 权威档位表异步加载，就绪后覆盖同步兜底表（fallbackTiers 保证首回合即可决策）。
+  // 仅在刷新成功时覆盖，避免把兜底表清成 null。
   const tiersReady = refreshModelTiers(llm)
   tiersReady.then((t) => {
-    state.modelTiers = t
+    if (t) state.modelTiers = t
     log('model tiers: ' + JSON.stringify(t))
   }).catch((e) => log('model tiers refresh failed: ' + String(e)))
 

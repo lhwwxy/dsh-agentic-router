@@ -40,7 +40,10 @@ function mockCtx(opts = {}) {
       if (k === 'llm') {
         return {
           async listProviders() { return [{ id: 'deepseek-official' }] },
-          async listModels() { return [{ id: 'deepseek-v4-flash' }, { id: 'deepseek-v4-pro' }] },
+          async listModels() {
+            if (opts.slowModels) return new Promise(() => {}) // 永不 resolve：模拟档位表加载未完成
+            return [{ id: 'deepseek-v4-flash' }, { id: 'deepseek-v4-pro' }]
+          },
         }
       }
       if (k === 'messageFeedback') return opts.mf
@@ -118,6 +121,24 @@ test('v1.4.0 机制：inbox 决策并追加 request/header 真实切换（shadow
   assert.equal(stats.mode, 'active')
   assert.equal(stats.headerAppends, 1, 'stats 应统计追加次数')
   assert.equal(stats.lastActual.model, 'deepseek-v4-pro')
+})
+
+test('冷启动：档位表异步加载未完成时，inbox 仍用兜底档位立即切换（v1.4.1 修复）', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-router-coldstart-'))
+  const ctx = mockCtx({ slowModels: true }) // listModels 永不 resolve，模拟冷启动
+  apply(ctx, { home, mode: 'active' })
+  const inbox = ctx.listeners['agent/inbox/claimed']
+  assert.ok(inbox)
+
+  const session = mockSession('s1') // 当前 pro
+  const P = (t, text) => ({ agent: { sessionId: 's1', session }, turn: t, step: 1, signal: {}, message: { role: 'user', content: [{ type: 'text', text }] } })
+
+  // inbox 是同步的：调用后立即断言，不等待任何异步档位表加载
+  inbox(P(1, QA_TASK))
+  const appends = session.events.filter((e) => e.type === 'request/header')
+  assert.equal(appends.length, 1, '冷启动下也应立即追加 header')
+  assert.equal(appends[0].data.header.config.model, 'deepseek-v4-flash', '兜底档位表应把简单问答切到 flash')
+  assert.equal(appends[0].data.reason, 'router')
 })
 
 test('兜底路径：request 决策 + llm/stream 延迟应用（中途热加载场景）', async () => {
