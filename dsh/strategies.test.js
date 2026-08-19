@@ -1,0 +1,218 @@
+// 策略与飞轮测试：UCB 冷启动轮转 / mid 回退 / 奖励公式 / applyReward 更新
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import {
+  tierOf, tierTarget, resolveTier,
+  recommendRule, recommendUcb, recommendLin, recommendKnn,
+  rewardOf, applyReward, correctReward,
+  DEFAULT_PRICES, turnCostYuan, resolvePrice,
+} from '../dsh/strategies.js'
+import { metaPick, DEFAULT_WEIGHTS } from '../dsh/meta.js'
+
+const MODEL_TIERS = {
+  providers: [{ provider: 'deepseek-official', models: ['deepseek-v4-flash', 'deepseek-v4-pro'] }],
+  tiers: { fast: ['deepseek-official/deepseek-v4-flash'], mid: [], strong: ['deepseek-official/deepseek-v4-pro'] },
+}
+
+test('tierOf 按 id 关键词分档', () => {
+  assert.equal(tierOf('deepseek-v4-flash'), 'fast')
+  assert.equal(tierOf('deepseek-v4-pro'), 'strong')
+  assert.equal(tierOf('some-model-x'), 'mid')
+})
+
+test('UCB 冷启动：三个未探索臂∞平局时轮转，不会永远选 fast（实测修复）', () => {
+  const st = { total: 0, arms: {} }
+  const t0 = recommendUcb({ type: 'qa' }, st).tier
+  st.total = 1
+  const t1 = recommendUcb({ type: 'qa' }, st).tier
+  st.total = 2
+  const t2 = recommendUcb({ type: 'qa' }, st).tier
+  assert.deepEqual([t0, t1, t2].sort(), ['fast', 'mid', 'strong'])
+})
+
+test('UCB 利用：三臂都有样本时高均值臂胜出（未探索臂上界∞是合法探索）', () => {
+  const st = {
+    total: 30,
+    arms: {
+      'qa:fast': { n: 10, mean: 0.2 },
+      'qa:mid': { n: 10, mean: 0.1 },
+      'qa:strong': { n: 10, mean: 1 },
+    },
+  }
+  assert.equal(recommendUcb({ type: 'qa' }, st).tier, 'strong')
+  // 反之：strong 未探索时，UCB 应合法地选择探索它
+  const st2 = {
+    total: 20,
+    arms: { 'qa:fast': { n: 10, mean: 0.9 }, 'qa:mid': { n: 10, mean: 0.8 } },
+  }
+  assert.equal(recommendUcb({ type: 'qa' }, st2).tier, 'strong')
+})
+
+test('v1.4.2：availableTiers 过滤后 UCB/LinUCB 只推荐可用档位（不探索无候选的 mid）', () => {
+  const st = { total: 0, arms: {} }
+  const lin = { total: 0, tierN: { fast: 0, mid: 0, strong: 0 }, tierW: { fast: new Array(9).fill(0), mid: new Array(9).fill(0), strong: new Array(9).fill(0) } }
+  const f = [1, 0, 0.01, 0, 0, 0, 0, 0, 0]
+  for (let i = 0; i < 8; i++) {
+    const u = recommendUcb({ type: 'qa' }, st, ['fast', 'strong'])
+    const l = recommendLin({ type: 'qa' }, f, lin, ['fast', 'strong'])
+    st.total += 1
+    assert.ok(['fast', 'strong'].includes(u.tier), 'UCB 不得推荐 mid，实际 ' + u.tier)
+    assert.ok(['fast', 'strong'].includes(l.tier), 'LinUCB 不得推荐 mid，实际 ' + l.tier)
+  }
+  // k-NN：经验池里有 mid 邻居时，也不得推荐 mid
+  const pool = [
+    { f, tier: 'fast', r: 0.9 },
+    { f, tier: 'fast', r: 0.8 },
+    { f, tier: 'mid', r: 0.7 },
+    { f, tier: 'mid', r: 0.6 },
+    { f, tier: 'strong', r: 0.4 },
+  ]
+  const knn = recommendKnn({ type: 'qa' }, f, { pool }, ['fast', 'strong'])
+  assert.ok(['fast', 'strong'].includes(knn.tier), 'k-NN 不得推荐 mid，实际 ' + knn.tier)
+})
+
+test('resolveTier：mid 档无候选时向上取 strong（实测修复）', () => {
+  assert.deepEqual(resolveTier('mid', 'deepseek-official', MODEL_TIERS),
+    { target: 'deepseek-v4-pro', used: 'strong', note: 'mid->strong fallback' })
+  assert.equal(resolveTier('fast', 'deepseek-official', MODEL_TIERS).target, 'deepseek-v4-flash')
+  assert.equal(resolveTier('strong', 'deepseek-official', MODEL_TIERS).target, 'deepseek-v4-pro')
+})
+
+test('规则表阈值：低→fast，中→mid，高→strong', () => {
+  assert.equal(recommendRule({ complexity: 0.1 }).tier, 'fast')
+  assert.equal(recommendRule({ complexity: 0.5 }).tier, 'mid')
+  assert.equal(recommendRule({ complexity: 0.8 }).tier, 'strong')
+})
+
+test('质量代理奖励：工具失败 −0.2/次（封顶 0.6），重试 −0.2/次（封顶 0.4），延迟分档', () => {
+  assert.equal(rewardOf({ toolErrors: 1, retries: 0 }, 'clean-close', 1000).reward, 0.8)
+  assert.equal(rewardOf({ toolErrors: 5, retries: 0 }, 'clean-close', 1000).reward, 0.4)
+  assert.equal(rewardOf({ toolErrors: 0, retries: 4 }, 'clean-close', 1000).reward, 0.6)
+  assert.equal(rewardOf({ toolErrors: 0, retries: 0 }, 'clean-close', 40000).reward, 0.9)
+  assert.equal(rewardOf({ toolErrors: 0, retries: 0 }, 'error', 1000).reward, 0)
+})
+
+test('applyReward：更新 UCB/LinUCB/k-NN/EXP3 四个学习器', () => {
+  const state = {
+    ucb: { total: 0, arms: {} },
+    lin: { total: 0, tierN: { fast: 0, mid: 0, strong: 0 }, tierW: { fast: new Array(9).fill(0), mid: new Array(9).fill(0), strong: new Array(9).fill(0) } },
+    knn: { pool: [] },
+    exp3: { total: 0, weights: { ...DEFAULT_WEIGHTS } },
+  }
+  const rec = {
+    reward: 0.8, clsType: 'qa', ucbTier: 'fast', linTier: 'fast',
+    f: [1, 0.1, 0.01, 0, 0, 0, 0, 0, 1],
+    chosen: 'rule', pChosen: 0.7, pool: ['ucb', 'rule'],
+  }
+  applyReward(state, rec)
+  assert.equal(state.ucb.arms['qa:fast'].n, 1)
+  assert.equal(state.ucb.arms['qa:fast'].mean, 0.8)
+  assert.equal(state.lin.tierN.fast, 1)
+  assert.equal(state.knn.pool.length, 1)
+  assert.ok(state.exp3.weights.rule > DEFAULT_WEIGHTS.rule, '被选策略权重应上升')
+})
+
+test('metaPick：冷启动只有 ucb+rule 入池，rule 初始权重 2.5 占优', () => {
+  const recs = {
+    rule: { tier: 'fast', conf: 0.5 },
+    ucb: { tier: 'fast', conf: 0.2 },
+    lin: { tier: 'fast', conf: 0.1 },
+    knn: { tier: null, conf: 0 },
+  }
+  const exp3 = { weights: { ...DEFAULT_WEIGHTS }, linGraduated: false, knnGraduated: false }
+  const m = metaPick(recs, exp3)
+  assert.deepEqual(m.pool.sort(), ['rule', 'ucb'])
+  assert.ok(Math.abs(m.ps.rule - 2.5 / 3.5) < 1e-9)
+  assert.ok(m.byName[m.chosen])
+})
+
+test('k-NN 冷启动：经验不足时给 null 档', () => {
+  const r = recommendKnn({ type: 'qa' }, [1, 0.1, 0.01, 0, 0, 0, 0, 0, 1], { pool: [] })
+  assert.equal(r.tier, null)
+  assert.equal(r.conf, 0)
+})
+
+test('k-NN 推荐：邻居经验按均值选档', () => {
+  const pool = []
+  const f = [1, 0.1, 0.01, 0, 0, 0, 0, 0, 1]
+  for (let i = 0; i < 10; i++) {
+    pool.push({ f: [1, 0.11, 0.01, 0, 0, 0, 0, 0, 1], tier: 'strong', r: 1 })
+    pool.push({ f: [1, 0.12, 0.01, 0, 0, 0, 0, 0, 1], tier: 'fast', r: 0.3 })
+  }
+  const r = recommendKnn({ type: 'qa' }, f, { pool })
+  assert.equal(r.tier, 'strong')
+  assert.ok(r.conf > 0)
+})
+
+test('correctReward：反馈修正精确回退 UCB 均值与 EXP3 权重', () => {
+  const state = {
+    ucb: { total: 1, arms: {} },
+    lin: { total: 1, tierN: { fast: 1, mid: 0, strong: 0 }, tierW: { fast: new Array(9).fill(0), mid: new Array(9).fill(0), strong: new Array(9).fill(0) } },
+    knn: { pool: [] },
+    exp3: { total: 1, weights: { ...DEFAULT_WEIGHTS } },
+  }
+  const rec = {
+    reward: 1, clsType: 'qa', ucbTier: 'fast', linTier: 'fast',
+    f: [1, 0.1, 0.01, 0, 0, 0, 0, 0, 1],
+    chosen: 'rule', pChosen: 0.7, pool: ['ucb', 'rule'],
+  }
+  applyReward(state, rec)
+  assert.equal(state.ucb.arms['qa:fast'].mean, 1)
+  const wBefore = state.exp3.weights.rule
+
+  correctReward(state, rec, 0.5)
+  assert.equal(state.ucb.arms['qa:fast'].n, 1, 'n 不变')
+  assert.equal(state.ucb.arms['qa:fast'].mean, 0.5, '均值修正为 0.5')
+  assert.ok(state.exp3.weights.rule < wBefore, 'EXP3 权重应乘性回退')
+  assert.ok(Math.abs(state.exp3.weights.rule - DEFAULT_WEIGHTS.rule * Math.exp(0.3 * (0.5 / 0.7) / 2)) < 1e-9, 'EXP3 回退为精确逆运算')
+  assert.equal(rec.reward, 0.5, '记录同步更新')
+})
+
+test('correctReward：无变化时不修正', () => {
+  const state = {
+    ucb: { total: 1, arms: {} },
+    lin: { total: 1, tierN: { fast: 1, mid: 0, strong: 0 }, tierW: { fast: new Array(9).fill(0), mid: new Array(9).fill(0), strong: new Array(9).fill(0) } },
+    knn: { pool: [] },
+    exp3: { total: 1, weights: { ...DEFAULT_WEIGHTS } },
+  }
+  const rec = { reward: 0.8, clsType: 'qa', ucbTier: 'fast', linTier: 'fast', f: [1, 0, 0, 0, 0, 0, 0, 0, 1], chosen: 'rule', pChosen: 0.7, pool: ['ucb', 'rule'] }
+  applyReward(state, rec)
+  const snapshot = JSON.stringify(state.ucb)
+  correctReward(state, rec, 0.8)
+  assert.equal(JSON.stringify(state.ucb), snapshot)
+})
+
+test('turnCostYuan：三级价格解析（缓存读计入输入、推理计入输出）', () => {
+  const usage = { inputTokens: 1000, outputTokens: 100, cacheReadTokens: 500, reasoningTokens: 50 }
+  // 1) 精确模型价：deepseek-v4-pro = (1500×1 + 150×12)/1e6 = 0.0033
+  assert.ok(Math.abs(turnCostYuan(usage, 'deepseek-official', 'deepseek-v4-pro', 'strong', DEFAULT_PRICES) - 0.0033) < 1e-9)
+  // 2) provider 档位价：acme/xyz-pro 无精确价 → acme.strong = (1500×5 + 150×50)/1e6 = 0.015
+  const acme = { acme: { strong: { in: 5, out: 50 } } }
+  assert.ok(Math.abs(turnCostYuan(usage, 'acme', 'xyz-pro', 'strong', acme) - 0.015) < 1e-9)
+  // 3) 未知 provider 用 '*' 通用档位（绝不套用 DeepSeek 价）：'*'.fast = (1500×1 + 150×4)/1e6 = 0.0021
+  assert.ok(Math.abs(turnCostYuan(usage, 'mystery', 'some-model', 'fast', DEFAULT_PRICES) - 0.0021) < 1e-9)
+  // 4) 连 '*' 都没有 → 保守兜底 (3,16) = (1500×3 + 150×16)/1e6 = 0.0069
+  assert.ok(Math.abs(turnCostYuan(usage, 'mystery', 'some-model', 'fast', {}) - 0.0069) < 1e-9)
+  assert.equal(turnCostYuan(null, 'deepseek-official', 'deepseek-v4-pro', 'strong', DEFAULT_PRICES), 0)
+})
+
+test('resolvePrice 返回来源标注（透明审计）', () => {
+  const acme = { acme: { strong: { in: 5, out: 50 } } }
+  assert.equal(resolvePrice('deepseek-official', 'deepseek-v4-pro', 'strong', DEFAULT_PRICES).source, 'provider-model')
+  assert.equal(resolvePrice('acme', 'xyz-pro', 'strong', acme).source, 'provider-tier')
+  assert.equal(resolvePrice('mystery', 'some-model', 'fast', DEFAULT_PRICES).source, 'generic-tier')
+  assert.equal(resolvePrice('mystery', 'some-model', 'fast', {}).source, 'unknown-conservative')
+})
+
+test('rewardOf 成本项：weight×元封顶 cap', () => {
+  const td = { toolErrors: 0, retries: 0, costYuan: 0.02, costWeight: 20, costCap: 0.5 }
+  const r = rewardOf(td, 'clean-close', 1000)
+  assert.ok(Math.abs(r.reward - 0.6) < 1e-9, '1 − 0.4 = 0.6，实际 ' + r.reward)
+  assert.equal(r.breakdown.costPenalty, 0.4)
+  assert.equal(r.breakdown.costYuan, 0.02)
+
+  const td2 = { toolErrors: 0, retries: 0, costYuan: 0.1, costWeight: 20, costCap: 0.5 }
+  const r2 = rewardOf(td2, 'clean-close', 1000)
+  assert.equal(r2.breakdown.costPenalty, 0.5, '惩罚封顶 0.5')
+  assert.equal(r2.reward, 0.5)
+})

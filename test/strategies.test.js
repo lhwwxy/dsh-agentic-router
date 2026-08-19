@@ -48,6 +48,29 @@ test('UCB 利用：三臂都有样本时高均值臂胜出（未探索臂上界�
   assert.equal(recommendUcb({ type: 'qa' }, st2).tier, 'strong')
 })
 
+test('v1.4.2：availableTiers 过滤后 UCB/LinUCB 只推荐可用档位（不探索无候选的 mid）', () => {
+  const st = { total: 0, arms: {} }
+  const lin = { total: 0, tierN: { fast: 0, mid: 0, strong: 0 }, tierW: { fast: new Array(9).fill(0), mid: new Array(9).fill(0), strong: new Array(9).fill(0) } }
+  const f = [1, 0, 0.01, 0, 0, 0, 0, 0, 0]
+  for (let i = 0; i < 8; i++) {
+    const u = recommendUcb({ type: 'qa' }, st, ['fast', 'strong'])
+    const l = recommendLin({ type: 'qa' }, f, lin, ['fast', 'strong'])
+    st.total += 1
+    assert.ok(['fast', 'strong'].includes(u.tier), 'UCB 不得推荐 mid，实际 ' + u.tier)
+    assert.ok(['fast', 'strong'].includes(l.tier), 'LinUCB 不得推荐 mid，实际 ' + l.tier)
+  }
+  // k-NN：经验池里有 mid 邻居时，也不得推荐 mid
+  const pool = [
+    { f, tier: 'fast', r: 0.9 },
+    { f, tier: 'fast', r: 0.8 },
+    { f, tier: 'mid', r: 0.7 },
+    { f, tier: 'mid', r: 0.6 },
+    { f, tier: 'strong', r: 0.4 },
+  ]
+  const knn = recommendKnn({ type: 'qa' }, f, { pool }, ['fast', 'strong'])
+  assert.ok(['fast', 'strong'].includes(knn.tier), 'k-NN 不得推荐 mid，实际 ' + knn.tier)
+})
+
 test('resolveTier：mid 档无候选时向上取 strong（实测修复）', () => {
   assert.deepEqual(resolveTier('mid', 'deepseek-official', MODEL_TIERS),
     { target: 'deepseek-v4-pro', used: 'strong', note: 'mid->strong fallback' })

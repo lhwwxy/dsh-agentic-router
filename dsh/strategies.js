@@ -40,11 +40,13 @@ export function recommendRule(cls) {
   return { tier: want, reason: 'rule threshold complexity=' + cls.complexity, conf: 0.5 }
 }
 
-// UCB：mean + c·√(lnN/n)；未探索臂上界∞，多个∞平局时按总拉动数轮转（避免永远选 fast）
-export function recommendUcb(cls, ucbState) {
+// UCB：mean + c·√(lnN/n)；未探索臂上界∞，多个∞平局时按总拉动数轮转（避免永远选 fast）。
+// availableTiers 由调用方传入（当前 provider 有候选模型的档位）——不探索无候选的"幽灵档"
+// （如 mid 无模型时，探索 mid 只会白费并回退到最贵的 strong）。
+export function recommendUcb(cls, ucbState, availableTiers = ['fast', 'mid', 'strong']) {
   const arms = ucbState.arms
   const scores = []
-  for (const tier of ['fast', 'mid', 'strong']) {
+  for (const tier of availableTiers) {
     const arm = arms[cls.type + ':' + tier] || { n: 0, mean: 0 }
     const ucb = arm.n > 0 ? arm.mean + 1.2 * Math.sqrt(Math.log(ucbState.total + 1) / arm.n) : Infinity
     scores.push({ tier, ucb, arm })
@@ -61,11 +63,12 @@ export function recommendUcb(cls, ucbState) {
   }
 }
 
-// LinUCB（近似实现）：每档线性权重 w·f + 探索项；梯度更新，探索项随档样本数衰减
-export function recommendLin(cls, f, linState) {
+// LinUCB（近似实现）：每档线性权重 w·f + 探索项；梯度更新，探索项随档样本数衰减。
+// availableTiers 同上：只评估有候选模型的档位。
+export function recommendLin(cls, f, linState, availableTiers = ['fast', 'mid', 'strong']) {
   const tn = linState.tierN
   let best = null
-  for (const tier of ['fast', 'mid', 'strong']) {
+  for (const tier of availableTiers) {
     const w = linState.tierW[tier] || []
     let dot = 0
     for (let i = 0; i < f.length; i++) dot += (w[i] || 0) * f[i]
@@ -80,8 +83,9 @@ export function recommendLin(cls, f, linState) {
   }
 }
 
-// k-NN：欧氏距离取 k=5 邻居，按邻居平均奖励选档
-export function recommendKnn(cls, f, knnState) {
+// k-NN：欧氏距离取 k=5 邻居，按邻居平均奖励选档。
+// availableTiers 同上：只从有候选模型的档位里选最佳。
+export function recommendKnn(cls, f, knnState, availableTiers = ['fast', 'mid', 'strong']) {
   const pool = knnState.pool
   if (pool.length < 5) return { tier: null, reason: 'knn cold (' + pool.length + '/5 seed)', conf: 0 }
   const scored = []
@@ -98,7 +102,7 @@ export function recommendKnn(cls, f, knnState) {
     if (agg[t]) { agg[t].n += 1; agg[t].s += scored[i].e.r }
   }
   let best = null
-  for (const tier of ['fast', 'mid', 'strong']) {
+  for (const tier of availableTiers) {
     const a = agg[tier]
     if (!best || (a.n > 0 && a.s / a.n > best.score)) best = { tier, score: a.n > 0 ? a.s / a.n : -1 }
   }

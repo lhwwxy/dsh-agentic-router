@@ -141,6 +141,26 @@ test('冷启动：档位表异步加载未完成时，inbox 仍用兜底档位�
   assert.equal(appends[0].data.reason, 'router')
 })
 
+test('v1.4.2：UCB 不探索无候选的 mid 档——简单任务决策里 recs.ucb 不得为 mid', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-router-notier-'))
+  const ctx = mockCtx() // 档位表只有 flash/pro（fast/strong），mid 无候选
+  apply(ctx, { home, mode: 'active' })
+  const inbox = ctx.listeners['agent/inbox/claimed']
+  const session = mockSession('s1')
+  const P = (t, text) => ({ agent: { sessionId: 's1', session }, turn: t, step: 1, signal: {}, message: { role: 'user', content: [{ type: 'text', text }] } })
+
+  // 连发 6 个简单问答，覆盖 UCB 冷启动轮转
+  for (let i = 1; i <= 6; i++) inbox(P(i, QA_TASK + '（第' + i + '问）'))
+
+  const store = new Store(home)
+  const decisions = store.loadJsonl('decisions.jsonl')
+  assert.equal(decisions.length, 6)
+  for (const d of decisions) {
+    assert.ok(!String(d.recs.ucb).startsWith('mid'), 'UCB 不得推荐 mid，实际 ' + d.recs.ucb)
+    assert.ok(!String(d.recs.lin).startsWith('mid'), 'LinUCB 不得推荐 mid，实际 ' + d.recs.lin)
+  }
+})
+
 test('兜底路径：request 决策 + llm/stream 延迟应用（中途热加载场景）', async () => {
   const home = mkdtempSync(join(tmpdir(), 'dsh-router-fallback-'))
   const session = mockSession('s1')

@@ -54,6 +54,15 @@ function fallbackTiers() {
   return { providers, tiers }
 }
 
+// 当前 provider 有候选模型的档位列表（UCB/LinUCB/k-NN 只在这些档位间探索）。
+// provider 缺失或档位表不可用时回退到全部档位（保持专家函数原有行为）。
+function availableTiersFor(provider, modelTiers) {
+  const all = ['fast', 'mid', 'strong']
+  if (!modelTiers || !provider) return all
+  const has = all.filter((t) => tierTarget(t, provider, modelTiers))
+  return has.length ? has : all
+}
+
 function freshState() {
   return {
     mode: 'shadow',
@@ -310,11 +319,14 @@ export function apply(ctx, config = {}) {
     if (state.turnDecision[key]) return null
     const cls = classify(text)
     const f = featuresOf(cls, text)
+    // 只探索当前 provider 有候选模型的档位（跳过无候选的"幽灵档"，
+    // 如 mid 无模型时探索 mid 只会白费并回退到最贵的 strong）
+    const available = availableTiersFor(provider, state.modelTiers)
     const recs = {
       rule: recommendRule(cls),
-      ucb: recommendUcb(cls, state.ucb),
-      lin: recommendLin(cls, f, state.lin),
-      knn: recommendKnn(cls, f, state.knn),
+      ucb: recommendUcb(cls, state.ucb, available),
+      lin: recommendLin(cls, f, state.lin, available),
+      knn: recommendKnn(cls, f, state.knn, available),
     }
     if (state.forced) recs.rule = { tier: 'forced', reason: 'forced', conf: 1 }
     const exp3 = {
