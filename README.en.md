@@ -4,14 +4,16 @@
 
 DeepSeek Harness (DSH) plugin: a **learning agentic router with a data flywheel**.
 
-It watches every model request, routes it to the most appropriate model tier by task type and complexity, asks four experts in parallel and lets an EXP3 meta-selector decide who to trust. Every turn is scored with **quality-proxy signals** (tool failures, model retries, latency) and the reward feeds back into the strategies — the router gets better as it runs. Every decision and reward is persisted locally: auditable and replayable.
+At the start of every turn (`agent/inbox/claimed`) it routes the request to the most appropriate model tier by task type and complexity, asks four experts in parallel and lets an EXP3 meta-selector decide who to trust. Every turn is scored with **quality-proxy signals** (tool failures, model retries, cost, latency) and the reward feeds back into the strategies — the router gets better as it runs. Every decision and reward is persisted locally: auditable and replayable.
+
+**Real switching since v1.4.0**: v1.3.0 and earlier swapped models by returning a replaced config from the `agent/request` waterfall, but DSH's built-in model-selection listener overrides that value, so the swap never took effect. v1.4.0 instead appends a `request/header` event (reason: `router`) to the session log at turn start, going through DSH's official model-selection precedence chain (in-process selection → latest logged session `request/header` → default model).
 
 ## Architecture
 
 ```
-user input → classify (rules, <1ms) → 4 expert recommendations → EXP3 meta-pick → agent/request swap
-                                           ↑                              │
-              UCB/LinUCB/k-NN/EXP3 updates ← quality-proxy reward ← turn end (tool errors/retries/latency)
+user input → classify (rules, <1ms) → 4 expert recommendations → EXP3 meta-pick → request/header append (real switch)
+                                            ↑                              │
+              UCB/LinUCB/k-NN/EXP3 updates ← quality-proxy reward ← turn end (tool errors/retries/cost/latency)
 ```
 
 | Expert | Algorithm | Status |

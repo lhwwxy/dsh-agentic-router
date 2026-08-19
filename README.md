@@ -4,14 +4,22 @@
 
 DeepSeek Harness（DSH）插件：**学习型智能路由（agentic router）+ 数据飞轮**。
 
-监听每次模型请求，按任务类型与复杂度把请求路由到最合适的模型档位；四个专家并行推荐、EXP3 元选择器决定听谁的；每回合按**质量代理信号**（工具失败、模型重试、延迟）计算奖励并回传，路由策略随使用越学越准。全部决策与奖励落盘，可审计、可重放。
+每回合开始时（`agent/inbox/claimed`）按任务类型与复杂度把请求路由到最合适的模型档位；
+四个专家并行推荐、EXP3 元选择器决定听谁的；每回合按**质量代理信号**
+（工具失败、模型重试、成本、延迟）计算奖励并回传，路由策略随使用越学越准。
+全部决策与奖励落盘，可审计、可重放。
+
+**v1.4.0 起切换真实生效**：v1.3.0 及之前通过 `agent/request` 返回替换后的配置切模型，
+但该返回值会被 DSH 内置的模型选择监听器强制改回，实际不生效；v1.4.0 改为在回合开始
+向会话日志追加 `request/header` 事件（reason: `router`），走 DSH 官方模型选择优先级链
+（本进程选择 → 会话日志最新 header → 默认模型）真实切换。
 
 ## 架构
 
 ```
-用户输入 → 分类(规则,<1ms) → 四专家推荐 → EXP3 元选择 → agent/request 切换模型
+用户输入 → 分类(规则,<1ms) → 四专家推荐 → EXP3 元选择 → request/header 追加(真实切换)
                                         ↑                        │
-                 UCB/LinUCB/k-NN/EXP3 更新 ← 质量代理奖励 ← 回合收尾(工具失败/重试/延迟)
+                 UCB/LinUCB/k-NN/EXP3 更新 ← 质量代理奖励 ← 回合收尾(工具失败/重试/成本/延迟)
 ```
 
 | 专家 | 算法 | 状态 |
@@ -30,7 +38,23 @@ DeepSeek Harness（DSH）插件：**学习型智能路由（agentic router）+ �
 dsh plugin --profile web add dsh-agentic-router
 ```
 
-> `--profile` 必填。安装后重启会话（或 profile），工具 schema 才会进入 prompt 组装。默认 **shadow 模式**（只记录与学习，不切换模型），确认策略表现后再切 active。
+> `--profile` 必填。安装后重启会话（或 profile），工具 schema 才会进入 prompt 组装。默认 **shadow 模式**（只记录与学习，不切换模型），确认策略表现后再切 active（`agentic_router_set_mode`，或安装时传 `config.mode: 'active'`）。
+
+## 切换机制（v1.4.0）
+
+DSH 的 agent 每步请求最终由模型选择逻辑决定，读取优先级为：
+
+```
+本进程选择 → 会话日志最新 request/header → 默认模型
+```
+
+- 直接改 `agent/request` waterfall 的返回值：会被 `dsh-agent` 自带监听器强制改回「选定模型」——无效（v1.3.0 及之前的缺陷）
+- 改 `llm/stream`：agent-loop 请求到达时已深度冻结，无法改写
+
+v1.4.0 的正确做法：在 `agent/inbox/claimed`（回合开始、prompt 组装之前）向会话日志追加
+`request/header` 事件，下一轮组装自然读到新模型。`agent/request` 只做只读观测
+（记录每步真实出网模型）；插件中途热加载时由 `llm/stream` 在循环自身 header 落盘后补一次应用。
+切到 fast/mid 档会去掉 `reasoningEffort`，让目标模型走自身默认 effort。
 
 ## 工具
 

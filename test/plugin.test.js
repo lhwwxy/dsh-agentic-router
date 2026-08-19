@@ -1,4 +1,5 @@
-// 插件端到端测试：mock ctx 模拟真实事件流（pre-step → request → turn-stopping）
+// 插件端到端测试（v1.4.0 机制）：inbox 决策 + request/header 追加真实切换；
+// agent/request 只读透传；llm/stream 提供 request 路径的兜底应用。
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtempSync } from 'node:fs'
@@ -6,6 +7,25 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply, name, inject } from '../dsh/index.js'
 import { Store } from '../dsh/store.js'
+
+// 会话 mock：requestHeader 反映最近追加的 header（模拟真实 fold 行为）
+function mockSession(id, startModel = 'deepseek-v4-pro') {
+  let model = startModel
+  const events = []
+  return {
+    id,
+    events,
+    append(type, data) {
+      events.push({ type, data })
+      if (type === 'request/header' && data && data.header && data.header.config && typeof data.header.config.model === 'string') {
+        model = data.header.config.model
+      }
+    },
+    requestHeader() {
+      return { config: { provider: 'deepseek-official', model }, adapterDefaults: {} }
+    },
+  }
+}
 
 function mockCtx(opts = {}) {
   const listeners = {}
@@ -25,14 +45,16 @@ function mockCtx(opts = {}) {
       }
       if (k === 'messageFeedback') return opts.mf
       if (k === 'timer') return opts.timer
+      if (k === 'sessions') return opts.sessions
+      if (k === 'agents') return opts.agents
       return undefined
     },
     on(ev, fn) { listeners[ev] = fn; return () => {} },
   }
 }
 
-function payload(sessionId, turn) {
-  return { agent: { sessionId }, turn, step: 1, signal: {} }
+function payload(sessionId, turn, session) {
+  return { agent: { sessionId, session: session || mockSession(sessionId) }, turn, step: 1, signal: {} }
 }
 
 const CODE_TASK = '重构下面这段 Python 代码，使其支持多线程并发执行并安全处理异常：\n\n```python\nimport time\ndef fetch(url):\n    time.sleep(1)\n```'
@@ -43,49 +65,85 @@ test('插件声明', () => {
   assert.ok(inject.includes('tools'))
 })
 
-test('端到端：shadow 记录不切换 → active 按元选择切换 → 奖励落盘', async () => {
+test('v1.4.0 机制：inbox 决策并追加 request/header 真实切换（shadow 不动、active 切换、request 只读透传）', async () => {
   const home = mkdtempSync(join(tmpdir(), 'dsh-router-'))
   const ctx = mockCtx()
   apply(ctx, { home })
-
+  const inbox = ctx.listeners['agent/inbox/claimed']
   const req = ctx.listeners['agent/request']
-  const pre = ctx.listeners['agent/pre-step']
   const stop = ctx.listeners['agent/turn-stopping']
-  assert.ok(req && pre && stop, '事件监听应全部挂载')
+  assert.ok(inbox && req && stop, '事件监听应全部挂载')
   assert.equal(ctx.registered.length, 5, '应注册 5 个工具')
 
-  const nextPro = async () => ({ provider: 'deepseek-official', model: 'deepseek-v4-pro' })
+  const session = mockSession('s1')
+  const P = (t, text) => ({ agent: { sessionId: 's1', session }, turn: t, step: 1, signal: {}, message: { role: 'user', content: [{ type: 'text', text }] } })
+  const headers = () => session.events.filter((e) => e.type === 'request/header')
 
-  // shadow 模式：复杂代码任务 → 记录但模型不变
-  await pre({ ...payload('s1', 1), messages: [{ content: [{ type: 'text', text: CODE_TASK }] }] }, async () => ({}))
-  const cfg1 = await req(payload('s1', 1), nextPro)
-  assert.equal(cfg1.model, 'deepseek-v4-pro', 'shadow 模式不得切换')
+  // shadow 模式（默认）：复杂代码任务 → 记录决策，但不追加 header
+  await inbox(P(1, CODE_TASK))
+  assert.equal(headers().length, 0, 'shadow 模式不得切换')
 
   // 切 active
   const setMode = ctx.registered.find((t) => t.name === 'agentic_router_set_mode')
   await setMode.execute({ mode: 'active' }, {})
 
-  // 简单问答 → 元层应切到 fast（flash）
-  await pre({ ...payload('s1', 2), messages: [{ content: [{ type: 'text', text: QA_TASK }] }] }, async () => ({}))
-  const cfg2 = await req(payload('s1', 2), nextPro)
-  assert.equal(cfg2.model, 'deepseek-v4-flash', 'active 模式简单任务应切 flash')
+  // 简单问答 → 追加 flash header
+  await inbox(P(2, QA_TASK))
+  const appends = headers()
+  assert.equal(appends.length, 1, 'active 模式应追加一次 request/header')
+  assert.equal(appends[0].data.header.config.model, 'deepseek-v4-flash', '简单任务应切 flash')
+  assert.equal(appends[0].data.reason, 'router')
+
+  // agent/request 必须只读透传（不再替换配置）
+  const cfg = await req(payload('s1', 2, session), async () => ({ provider: 'deepseek-official', model: 'deepseek-v4-pro' }))
+  assert.equal(cfg.model, 'deepseek-v4-pro', 'agent/request 必须透传原配置')
 
   // 收尾 → 奖励落盘且元数据完整
-  await stop(payload('s1', 2))
+  await stop(payload('s1', 2, session))
   const store = new Store(home)
   const rewards = store.loadJsonl('rewards.jsonl')
   assert.equal(rewards.length, 1)
   assert.ok(rewards[0].reward > 0)
   assert.equal(rewards[0].turn, 's1/2')
   assert.ok(Array.isArray(rewards[0].f) && rewards[0].f.length === 9, '奖励记录需含特征向量（供 replay）')
-  assert.equal(rewards[0].chosen, rewards[0].pool[0] === rewards[0].chosen ? rewards[0].chosen : rewards[0].chosen)
 
   const decisions = store.loadJsonl('decisions.jsonl')
   assert.equal(decisions.length, 2)
-  assert.equal(decisions[1].swapped || decisions[1].targetModel === 'deepseek-v4-flash', true)
+  assert.equal(decisions[1].targetModel, 'deepseek-v4-flash')
+  assert.equal(decisions[1].applied, true, 'header 追加成功应标记 applied')
+  assert.equal(decisions[1].swapped, true, '真实切换应标记 swapped')
+
   const stats = await ctx.registered.find((t) => t.name === 'agentic_router_stats').execute({}, {})
   assert.equal(stats.totalDecisions, 2)
   assert.equal(stats.mode, 'active')
+  assert.equal(stats.headerAppends, 1, 'stats 应统计追加次数')
+  assert.equal(stats.lastActual.model, 'deepseek-v4-pro')
+})
+
+test('兜底路径：request 决策 + llm/stream 延迟应用（中途热加载场景）', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-router-fallback-'))
+  const session = mockSession('s1')
+  const sessions = new Map([['s1', session]])
+  const ctx = mockCtx({ sessions })
+  apply(ctx, { home, mode: 'active' })
+  const pre = ctx.listeners['agent/pre-step']
+  const req = ctx.listeners['agent/request']
+  const stream = ctx.listeners['llm/stream']
+  assert.ok(pre && req && stream)
+
+  await pre({ ...payload('s1', 1, session), messages: [{ content: [{ type: 'text', text: QA_TASK }] }] }, async () => ({}))
+  const cfg = await req(payload('s1', 1, session), async () => ({ provider: 'deepseek-official', model: 'deepseek-v4-pro' }))
+  assert.equal(cfg.model, 'deepseek-v4-pro', 'request 路径也透传')
+
+  // 流式调用结束 → 补应用切换
+  const wrapped = stream({ sessionId: 's1', provider: 'deepseek-official' }, async function* () {
+    yield { type: 'finish', reason: 'stop' }
+  })
+  for await (const c of wrapped) { /* drain */ }
+
+  const appends = session.events.filter((e) => e.type === 'request/header')
+  assert.equal(appends.length, 1, 'llm/stream 后应补应用一次 header')
+  assert.equal(appends[0].data.header.config.model, 'deepseek-v4-flash')
 })
 
 test('飞轮重放：新实例从 rewards.jsonl 恢复学习状态', async () => {

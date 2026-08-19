@@ -1,14 +1,23 @@
 // dsh-agentic-router —— DeepSeek Harness 插件（Host 侧）
 //
-// 学习型智能路由：监听 agent/pre-step 与 agent/request，按任务类型与复杂度在
-// 模型档位（fast/mid/strong）之间路由；四个专家（规则表 / UCB / LinUCB / k-NN）
-// 并行推荐，EXP3 元选择器决定听谁的；回合结束时按质量代理信号
-// （工具失败 + 模型重试 + 延迟）计算奖励并回传飞轮。
+// 学习型智能路由（v1.4.0 修复版）：按任务类型与复杂度在模型档位（fast/mid/strong）
+// 之间路由；四个专家（规则表 / UCB / LinUCB / k-NN）并行推荐，EXP3 元选择器决定
+// 听谁的；回合结束时按质量代理信号（工具失败 + 模型重试 + 成本 + 延迟）计算奖励
+// 并回传飞轮；人类 👍/👎 反馈在结算窗口后修正奖励。
 //
-// 架构依据 docs/architecture.md：
-//   - "Add a model-facing capability"    → ctx.tools 注册 4 个管理工具
-//   - "Intercept a request"              → agent/request waterfall 替换 LlmCallConfig
-//   - 所有监听经 ctx.on 注册，随插件卸载自动回收
+// ── 切换机制（v1.4.0 修复）────────────────────────────────────────────
+// v1.3.0 及之前通过 `agent/request` waterfall 返回替换后的 LlmCallConfig 来切模型，
+// 但该返回值会被 dsh-agent 内置的模型选择监听器强制改回「选定模型」，实际不生效。
+// 正确做法是走 dsh 官方的模型选择优先级链：
+//
+//     本进程选择 → 会话日志最新 request/header → 默认模型
+//
+// 在 `agent/inbox/claimed`（回合开始、prompt 组装之前）向会话日志追加一条
+// `request/header` 事件（reason: 'router'），下一轮组装就会读到新模型，真正生效。
+// `agent/request` 只做只读观测（记录每步实际出网模型）；插件中途热加载时，
+// `llm/stream` 在循环自身 header 落盘后补一次应用（deferred apply）。
+//
+// 其余架构依据 docs/architecture.md；所有监听经 ctx.on 注册，随插件卸载自动回收。
 // 飞轮数据落盘 ${DSH_HOME:-~/.dsh}/storages/dsh-agentic-router/，重启后重放恢复。
 
 import { classify, featuresOf } from './classify.js'
@@ -41,6 +50,8 @@ function freshState() {
     openTurns: new Map(),
     pendingFeedback: [],
     recByTurn: new Map(),
+    headerAppends: 0,
+    lastActual: null,
     ucb: { total: 0, arms: {} },
     lin: {
       total: 0,
@@ -87,6 +98,20 @@ function textOfMessages(messages) {
   return parts.join('\n').trim()
 }
 
+function extractText(message) {
+  if (message == null) return ''
+  if (typeof message.text === 'string') return message.text
+  const blocks = message.content
+  if (Array.isArray(blocks)) {
+    let out = ''
+    for (const b of blocks) {
+      if (b && typeof b === 'object' && b.type === 'text' && typeof b.text === 'string') out += b.text + '\n'
+    }
+    return out
+  }
+  return ''
+}
+
 function isErrorResult(r) {
   if (r == null || typeof r !== 'object') return false
   if (r.ok === false || r.success === false) return true
@@ -108,6 +133,57 @@ function execAgentKey(exec) {
     if (typeof exec.agentId === 'string') return exec.agentId
   } catch {}
   return null
+}
+
+// 会话句柄：agent 的 session（inbox / request 路径）
+function sessionOf(payload) {
+  try {
+    const a = payload && payload.agent
+    const s = a && a.session
+    if (s && typeof s.append === 'function' && typeof s.requestHeader === 'function' && typeof s.id === 'string') return s
+  } catch {}
+  return null
+}
+
+function headerConfig(session) {
+  try {
+    const h = session.requestHeader()
+    if (h && h.config && typeof h.config === 'object') return h.config
+  } catch {}
+  return null
+}
+
+function currentModel(session) {
+  const c = headerConfig(session)
+  return c && typeof c.model === 'string' ? c.model : null
+}
+
+function currentProvider(session) {
+  const c = headerConfig(session)
+  return c && typeof c.provider === 'string' ? c.provider : ''
+}
+
+// 核心切换：向会话日志追加 request/header（reason: 'router'），
+// 下一轮 prompt 组装即读到新模型。fast/mid 档去掉 reasoningEffort，
+// 让目标模型走自身默认 effort（避免 flash 不支持 max 而整步失败）。
+function appendRouterHeader(session, targetModel) {
+  try {
+    const last = session.requestHeader()
+    const header = {}
+    if (last && typeof last === 'object') {
+      for (const k of Object.keys(last)) header[k] = last[k]
+    }
+    const prevConfig = header.config && typeof header.config === 'object' ? header.config : {}
+    const config = {}
+    for (const k of Object.keys(prevConfig)) config[k] = prevConfig[k]
+    config.model = targetModel
+    if (tierOf(targetModel) !== 'strong') delete config.reasoningEffort
+    header.config = config
+    session.append('request/header', { header, reason: 'router' })
+    return true
+  } catch (e) {
+    return false
+  }
 }
 
 async function refreshModelTiers(llm) {
@@ -209,7 +285,117 @@ export function apply(ctx, config = {}) {
     timer.interval(() => { settleFeedback().catch((e) => log('settle sweep failed: ' + String(e))) }, SWEEP_MS)
   }
 
+  // ---- 决策流水线（inbox 与 request 兜底共用） ----
+  // 返回 { key, td, record, target }；已决策过本回合则返回 null。
+  // 档位表异步加载；决策前等待就绪（tiers-not-ready 会拿不到 target）。
+  async function decideAndRecord(payload, text, current, provider, source) {
+    if (!state.modelTiers) {
+      try { await tiersReady } catch (e) { /* keep null */ }
+    }
+    const key = fullKey(payload)
+    if (state.turnDecision[key]) return null
+    const cls = classify(text)
+    const f = featuresOf(cls, text)
+    const recs = {
+      rule: recommendRule(cls),
+      ucb: recommendUcb(cls, state.ucb),
+      lin: recommendLin(cls, f, state.lin),
+      knn: recommendKnn(cls, f, state.knn),
+    }
+    if (state.forced) recs.rule = { tier: 'forced', reason: 'forced', conf: 1 }
+    const exp3 = {
+      ...state.exp3,
+      linGraduated: state.lin.total >= LIN_GRADUATION,
+      knnGraduated: state.knn.pool.length >= KNN_GRADUATION,
+    }
+    const meta = metaPick(recs, exp3)
+    const chosenRec = meta.byName[meta.chosen] || recs.rule
+    const resolved = state.forced
+      ? { target: state.forced, used: 'forced', note: 'forced' }
+      : resolveTier(chosenRec.tier, provider, state.modelTiers)
+    const target = resolved.target
+    state.seq += 1
+    const td = {
+      clsType: cls.type, f, recs, meta, chosen: meta.chosen,
+      finalized: false, t0: now(), toolErrors: 0, retries: 0,
+      currentModel: current, provider, costWeight, costCap,
+      estInputTokens: Math.ceil(text.length / 1.5),
+      target, applied: false, needsApply: false, actualModel: current,
+    }
+    const record = {
+      seq: state.seq,
+      turn: key,
+      mode: state.mode,
+      taskType: cls.type,
+      complexity: cls.complexity,
+      inputPreview: text.slice(0, 100),
+      currentModel: current,
+      recs: {
+        rule: recs.rule.tier + '(' + recs.rule.conf + ')',
+        ucb: recs.ucb.tier + '(' + recs.ucb.conf + ')',
+        lin: recs.lin.tier + '(' + recs.lin.conf + ')',
+        knn: recs.knn.tier + '(' + recs.knn.conf + ')',
+      },
+      metaChosen: meta.chosen,
+      metaProbs: meta.ps,
+      metaPool: meta.pool,
+      resolvedTier: resolved.used + (resolved.note ? ' [' + resolved.note + ']' : ''),
+      targetModel: state.mode === 'active' ? target : null,
+      applied: false,
+      appliedAt: source,
+      swapped: false,
+    }
+    td.rec = record
+    state.turnDecision[key] = td
+    state.openTurns.set(agentKey(payload), key)
+    return { key, td, record, target }
+  }
+
+  // 决策记录落盘（在 applyDecision 之后调用，保证 applied/swapped 已是最终值）
+  function commitRecord(record) {
+    store.appendJsonl('decisions.jsonl', record)
+    state.decisions.push(record)
+    if (state.decisions.length > 200) state.decisions.shift()
+  }
+
+  // 应用切换：active 模式且目标与当前不同 → 追加 request/header。
+  // 返回是否真实追加成功。
+  function applyDecision(session, key, td, record, target) {
+    if (state.mode !== 'active' || !target) return false
+    const base = td.actualModel || td.currentModel
+    if (base && target === base) return false
+    const ok = session ? appendRouterHeader(session, target) : false
+    td.applied = ok
+    if (record) { record.applied = ok; record.swapped = ok }
+    if (ok) {
+      state.headerAppends++
+      log('SWAP -> ' + target + ' | ' + td.chosen + ' | ' + (td.recs && td.recs[td.chosen] ? td.recs[td.chosen].reason : ''))
+    }
+    return ok
+  }
+
   // ---- 事件挂载 ----
+  // 回合开始（prompt 组装之前）：捕获用户消息并决策，active 模式立即应用切换。
+  // 这是主路径——零延迟，回合第一步就按目标模型执行。
+  ctx.on('agent/inbox/claimed', async (payload) => {
+    try {
+      const session = sessionOf(payload)
+      const text = extractText(payload && payload.message)
+      if (!text) return
+      const current = session ? currentModel(session) : null
+      const provider = session ? currentProvider(session) : ''
+      const r = await decideAndRecord(payload, text, current, provider, 'inbox')
+      if (!r) return
+      applyDecision(session, r.key, r.td, r.record, r.target)
+      commitRecord(r.record)
+      log('decision #' + state.seq + ' type=' + r.td.clsType + ' c=' + r.td.f[1] +
+        ' meta=' + r.td.chosen + ' tier=' + r.record.resolvedTier +
+        ' applied=' + r.td.applied + ' target=' + (r.target || '-'))
+    } catch (e) {
+      log('inbox decide failed: ' + String(e))
+    }
+  })
+
   ctx.on('agent/pre-step', (payload, next) => {
     try {
       const text = textOfMessages(payload && payload.messages)
@@ -220,79 +406,35 @@ export function apply(ctx, config = {}) {
     return next()
   })
 
+  // 只读观测 + 兜底决策。观测：记录每步真实出网模型（供 stats 验证切换生效）。
+  // 兜底：inbox 未触发（插件中途热加载）时，在首个请求用 pending 文本决策，
+  // 但不再替换配置——改由 llm/stream 在循环 header 落盘后补应用。
   ctx.on('agent/request', async (payload, next) => {
     const cfg = await next()
     if (!cfg || typeof cfg !== 'object') return cfg
     try {
       if (!timer || typeof timer.interval !== 'function') settleFeedback().catch(() => {})
       const key = fullKey(payload)
-      if (state.turnDecision[key]) return cfg
+      const model = typeof cfg.model === 'string' ? cfg.model : null
+      const td = state.turnDecision[key]
+      if (td) {
+        if (model) {
+          td.actualModel = model
+          state.lastActual = { model, turn: payload.turn, step: payload.step, key }
+        }
+        return cfg
+      }
       const pkey = agentKey(payload) + ':' + payload.turn
       const text = state.pending.get(pkey) || ''
       state.pending.delete(pkey)
-      const cls = classify(text)
-      const f = featuresOf(cls, text)
-      const current = typeof cfg.model === 'string' ? cfg.model : '(unknown)'
       const provider = typeof cfg.provider === 'string' ? cfg.provider : ''
-      const recs = {
-        rule: recommendRule(cls),
-        ucb: recommendUcb(cls, state.ucb),
-        lin: recommendLin(cls, f, state.lin),
-        knn: recommendKnn(cls, f, state.knn),
+      const r = await decideAndRecord(payload, text, model, provider, 'request')
+      if (r) {
+        r.td.needsApply = state.mode === 'active' && r.target && r.target !== r.td.currentModel
+        commitRecord(r.record)
+        if (r.td.needsApply) log('decision #' + state.seq + ' -> apply deferred to llm/stream')
+        else log('decision #' + state.seq + ' type=' + r.td.clsType + ' meta=' + r.td.chosen + ' tier=' + r.record.resolvedTier)
       }
-      if (state.forced) recs.rule = { tier: 'forced', reason: 'forced', conf: 1 }
-      const exp3 = {
-        ...state.exp3,
-        linGraduated: state.lin.total >= LIN_GRADUATION,
-        knnGraduated: state.knn.pool.length >= KNN_GRADUATION,
-      }
-      const meta = metaPick(recs, exp3)
-      const chosenRec = meta.byName[meta.chosen] || recs.rule
-      const resolved = state.forced
-        ? { target: state.forced, used: 'forced', note: 'forced' }
-        : resolveTier(chosenRec.tier, provider, state.modelTiers)
-      const target = resolved.target
-      state.seq += 1
-      const record = {
-        seq: state.seq,
-        turn: key,
-        mode: state.mode,
-        taskType: cls.type,
-        complexity: cls.complexity,
-        inputPreview: text.slice(0, 100),
-        currentModel: current,
-        recs: {
-          rule: recs.rule.tier + '(' + recs.rule.conf + ')',
-          ucb: recs.ucb.tier + '(' + recs.ucb.conf + ')',
-          lin: recs.lin.tier + '(' + recs.lin.conf + ')',
-          knn: recs.knn.tier + '(' + recs.knn.conf + ')',
-        },
-        metaChosen: meta.chosen,
-        metaProbs: meta.ps,
-        metaPool: meta.pool,
-        resolvedTier: resolved.used + (resolved.note ? ' [' + resolved.note + ']' : ''),
-        targetModel: state.mode === 'active' ? target : null,
-        swapped: false,
-      }
-      state.turnDecision[key] = {
-        clsType: cls.type, f, recs, meta, chosen: meta.chosen,
-        finalized: false, t0: now(), toolErrors: 0, retries: 0,
-        currentModel: current, provider, costWeight, costCap,
-        estInputTokens: Math.ceil(text.length / 1.5),
-      }
-      state.openTurns.set(agentKey(payload), key)
-      store.appendJsonl('decisions.jsonl', record)
-      if (state.mode === 'active' && target && target !== current) {
-        record.swapped = true
-        state.decisions.push(record)
-        if (state.decisions.length > 200) state.decisions.shift()
-        log('SWAP -> ' + target + ' | ' + meta.chosen + ' | ' + chosenRec.reason + ' | ' + resolved.note)
-        return { ...cfg, model: target }
-      }
-      state.decisions.push(record)
-      if (state.decisions.length > 200) state.decisions.shift()
-      log('decision #' + state.seq + ' type=' + cls.type + ' c=' + cls.complexity +
-        ' meta=' + meta.chosen + ' tier=' + resolved.used + ' recs=' + JSON.stringify(record.recs))
     } catch (e) {
       log('decide failed: ' + String(e))
     }
@@ -313,7 +455,8 @@ export function apply(ctx, config = {}) {
   })
 
   // 成本信号：透传每次流式模型调用，累加 usage chunk 到当前 open turn；
-  // 无 usage 的 provider 用文本长度估算（estimated=true）
+  // 无 usage 的 provider 用文本长度估算（estimated=true）。
+  // 同时：request 路径的兜底决策在这里补应用切换（循环自身 header 已落盘，无竞态）。
   ctx.on('llm/stream', function (options, next) {
     return (async function* () {
       let usage = null
@@ -330,7 +473,19 @@ export function apply(ctx, config = {}) {
           const key = sid ? state.openTurns.get(sid) : null
           const td = key ? state.turnDecision[key] : null
           if (td && !td.finalized) {
+            // 兜底应用：request 路径决策未应用时，在 header 落盘后补切换
+            if (td.needsApply && !td.applied) {
+              let session = null
+              try {
+                const sessions = ctx.get('sessions')
+                if (sessions && typeof sessions.get === 'function') session = sessions.get(sid) || null
+              } catch (e) { session = null }
+              if (session) applyDecision(session, key, td, td.rec, td.target)
+            }
             const u = td.usage || { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, reasoningTokens: 0, estimated: false }
+            const model = (options && typeof options.model === 'string' && options.model) || td.currentModel || ''
+            const tier = tierOf(model)
+            const provider = (options && typeof options.provider === 'string' && options.provider) || td.provider || ''
             if (usage && typeof usage.inputTokens === 'number') {
               u.inputTokens += usage.inputTokens
               u.outputTokens += usage.outputTokens || 0
@@ -343,9 +498,6 @@ export function apply(ctx, config = {}) {
               u.estimated = true
             }
             td.usage = u
-            const model = typeof td.currentModel === 'string' ? td.currentModel : ''
-            const tier = tierOf(model)
-            const provider = (options && typeof options.provider === 'string' && options.provider) || td.provider || ''
             const rp = resolvePrice(provider, model, tier, prices)
             td.costYuan = turnCostYuan(u, provider, model, tier, prices)
             td.pricingSource = rp.source
@@ -419,10 +571,12 @@ export function apply(ctx, config = {}) {
   ctx.on('agent/turn-stopping', (payload) => finalize(payload, 'clean-close'))
   ctx.on('agent/error', (payload) => finalize(payload, 'error'))
 
-  refreshModelTiers(llm).then((t) => {
+  // 档位表异步加载；decideAndRecord 在决策前 await 此 promise
+  const tiersReady = refreshModelTiers(llm)
+  tiersReady.then((t) => {
     state.modelTiers = t
     log('model tiers: ' + JSON.stringify(t))
-  })
+  }).catch((e) => log('model tiers refresh failed: ' + String(e)))
 
   // ---- 工具 ----
   const OUT = (label) => ({
@@ -440,7 +594,7 @@ export function apply(ctx, config = {}) {
 
   register({
     name: 'agentic_router_stats',
-    description: '查看 agentic router（UCB/LinUCB/k-NN 三策略 + EXP3 元选择器 + 质量代理奖励）的决策记录、策略权重与飞轮学习状态。',
+    description: '查看 agentic router（UCB/LinUCB/k-NN 三策略 + EXP3 元选择器 + 质量代理奖励）的决策记录、策略权重、真实切换与飞轮学习状态。',
     parameters: { type: 'object', properties: {} },
     output: OUT('agentic router 状态'),
     isConcurrencySafe: () => true,
@@ -451,6 +605,9 @@ export function apply(ctx, config = {}) {
         totalDecisions: state.seq,
         modelTiers: state.modelTiers,
         prices,
+        mechanism: 'request/header append (agent/inbox/claimed)',
+        lastActual: state.lastActual,
+        headerAppends: state.headerAppends,
         flywheel: {
           ucb: state.ucb,
           lin: { total: state.lin.total, tierN: state.lin.tierN, tierW: state.lin.tierW },
@@ -461,6 +618,7 @@ export function apply(ctx, config = {}) {
           recentRewards: store.loadJsonl('rewards.jsonl').slice(-20),
         },
         recent: state.decisions.slice(-20),
+        note: '切换真实性验证：headerAppends 为本进程追加的 request/header 次数；lastActual 为最近一步真实出网模型；decisions[].applied=true 且 swapped=true 即真实切换成功',
       }
     },
   })
@@ -501,6 +659,23 @@ export function apply(ctx, config = {}) {
       if (args && typeof args.model === 'string') {
         state.forced = args.model
         store.savePolicy({ mode: state.mode, forced: args.model, prices })
+        // 立即对存活会话应用（下一请求生效）
+        if (state.mode === 'active') {
+          try {
+            const agents = ctx.get('agents')
+            if (agents && typeof agents.list === 'function') {
+              for (const agent of agents.list()) {
+                try {
+                  const session = sessionOf({ agent })
+                  if (session && currentModel(session) !== args.model) {
+                    const ok = appendRouterHeader(session, args.model)
+                    if (ok) state.headerAppends++
+                  }
+                } catch (e) { /* per-agent best effort */ }
+              }
+            }
+          } catch (e) { /* best effort */ }
+        }
         return { forced: args.model }
       }
       return { forced: state.forced, error: '需要 model 或 clear=true' }
@@ -552,6 +727,8 @@ export function apply(ctx, config = {}) {
       state.exp3 = { total: 0, weights: { ...DEFAULT_WEIGHTS } }
       state.seq = 0
       state.decisions = []
+      state.headerAppends = 0
+      state.lastActual = null
       return { reset: true, home: store.home }
     },
   })
