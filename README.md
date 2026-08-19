@@ -14,6 +14,12 @@ DeepSeek Harness（DSH）插件：**学习型智能路由（agentic router）+ �
 向会话日志追加 `request/header` 事件（reason: `router`），走 DSH 官方模型选择优先级链
 （本进程选择 → 会话日志最新 header → 默认模型）真实切换。
 
+**v1.5.0 步骤级路由**：在回合级基线之上，`agent/pre-step` 按**上一步的工具调用**做
+步骤级调整——重型工具（写代码/执行/子 agent 等，见 `HEAVY_TOOLS`）→ 下一步升级 strong
+（pro）；轻量/纯文本 → 回到回合基线档。实现"简单步骤 flash、复杂步骤 pro"的近似形态
+（步骤切换对下一步生效，一阶延迟）。步骤级决策落盘 `steps.jsonl`，`agentic_router_stats`
+可见 `stepSwitches` 与 `stepLog`。
+
 ## 架构
 
 ```

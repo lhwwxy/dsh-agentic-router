@@ -77,6 +77,8 @@ function freshState() {
     recByTurn: new Map(),
     headerAppends: 0,
     lastActual: null,
+    stepLog: [],
+    counters: { stepSwitches: 0 },
     ucb: { total: 0, arms: {} },
     lin: {
       total: 0,
@@ -188,10 +190,10 @@ function currentProvider(session) {
   return c && typeof c.provider === 'string' ? c.provider : ''
 }
 
-// 核心切换：向会话日志追加 request/header（reason: 'router'），
+// 核心切换：向会话日志追加 request/header（reason: 'router' / 'router-step'），
 // 下一轮 prompt 组装即读到新模型。fast/mid 档去掉 reasoningEffort，
 // 让目标模型走自身默认 effort（避免 flash 不支持 max 而整步失败）。
-function appendRouterHeader(session, targetModel) {
+function appendRouterHeader(session, targetModel, reason = 'router') {
   try {
     const last = session.requestHeader()
     const header = {}
@@ -204,11 +206,38 @@ function appendRouterHeader(session, targetModel) {
     config.model = targetModel
     if (tierOf(targetModel) !== 'strong') delete config.reasoningEffort
     header.config = config
-    session.append('request/header', { header, reason: 'router' })
+    session.append('request/header', { header, reason })
     return true
   } catch (e) {
     return false
   }
+}
+
+// 步骤级路由（v1.5.0）：视为"重型工作"的工具调用——上一步出现它们时，
+// 下一步升级到 strong（pro）处理其结果/继续执行；轻量工具保持回合基线。
+const HEAVY_TOOLS = new Set([
+  'bash', 'pwsh', 'write', 'edit', 'batch_edit', 'run_code', 'workflow',
+  'subagent', 'subagent_fork', 'terminal', 'pty', 'mcp',
+])
+
+// 读取会话里最后一条 assistant 消息的工具调用名（只取叶子字段，不碰活数据）。
+function lastToolCalls(session) {
+  try {
+    const msgs = typeof session.deriveMessages === 'function' ? session.deriveMessages() : null
+    if (!Array.isArray(msgs)) return []
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const m = msgs[i]
+      if (!m || typeof m !== 'object' || m.role !== 'assistant') continue
+      const blocks = m.content
+      if (!Array.isArray(blocks)) return []
+      const out = []
+      for (const b of blocks) {
+        if (b && typeof b === 'object' && b.type === 'tool-call' && typeof b.name === 'string') out.push(b.name)
+      }
+      return out
+    }
+  } catch (e) { /* read-only observation */ }
+  return []
 }
 
 async function refreshModelTiers(llm) {
@@ -347,6 +376,8 @@ export function apply(ctx, config = {}) {
       currentModel: current, provider, costWeight, costCap,
       estInputTokens: Math.ceil(text.length / 1.5),
       target, applied: false, needsApply: false, actualModel: current,
+      // 回合级基线（供步骤级路由 v1.5.0 参考：无重型工具时保持该档）
+      turnTier: target ? tierOf(target) : null, turnTarget: target,
     }
     const record = {
       seq: state.seq,
@@ -428,6 +459,38 @@ export function apply(ctx, config = {}) {
       if (text) state.pending.set(agentKey(payload) + ':' + payload.turn, text)
     } catch (e) {
       log('pre-step capture failed: ' + String(e))
+    }
+    // ---- 步骤级路由（v1.5.0）----
+    // pre-step 在组装之后触发 → 此处追加 header 对下一步生效（一阶延迟，设计如此）。
+    // 信号：上一步 assistant 消息的工具调用。重型工具（写代码/执行/子agent）→ 下一步
+    // 升级 strong（pro）；轻量/无工具 → 回到回合基线档。
+    try {
+      const session = sessionOf(payload)
+      if (!session) return next()
+      const key = fullKey(payload)
+      const td = state.turnDecision[key]
+      if (!td || td.finalized) return next()
+      const tools = lastToolCalls(session)
+      if (!tools.length) return next() // 上一步是纯文本（通常回合收尾），保持现状
+      const heavy = tools.some((n) => HEAVY_TOOLS.has(n))
+      const stepTier = heavy ? 'strong' : (td.turnTier || null)
+      if (!stepTier) return next()
+      const provider = td.provider || currentProvider(session) || ''
+      const resolved = resolveTier(stepTier, provider, state.modelTiers)
+      const target = resolved.target
+      const cur = currentModel(session)
+      const changed = target && target !== cur
+      if (changed) {
+        const ok = appendRouterHeader(session, target, 'router-step')
+        if (ok) state.counters.stepSwitches++
+        if (ok) log('STEP-SWAP -> ' + target + ' (tools: ' + tools.slice(0, 5).join(',') + ')')
+      }
+      const stepRec = { turn: key, step: payload.step, lastTools: tools.slice(0, 5), stepTier, target, current: cur, applied: changed, ts: Date.now() }
+      state.stepLog.push(stepRec)
+      if (state.stepLog.length > 30) state.stepLog.shift()
+      try { store.appendJsonl('steps.jsonl', stepRec) } catch (e) { /* 落盘尽力而为 */ }
+    } catch (e) {
+      log('step routing failed: ' + String(e))
     }
     return next()
   })
@@ -632,9 +695,11 @@ export function apply(ctx, config = {}) {
         totalDecisions: state.seq,
         modelTiers: state.modelTiers,
         prices,
-        mechanism: 'request/header append (agent/inbox/claimed)',
+        mechanism: 'request/header append (inbox turn-level + pre-step step-level v1.5.0)',
         lastActual: state.lastActual,
         headerAppends: state.headerAppends,
+        stepSwitches: state.counters.stepSwitches,
+        stepLog: state.stepLog.slice(-20),
         flywheel: {
           ucb: state.ucb,
           lin: { total: state.lin.total, tierN: state.lin.tierN, tierW: state.lin.tierW },
@@ -645,7 +710,7 @@ export function apply(ctx, config = {}) {
           recentRewards: store.loadJsonl('rewards.jsonl').slice(-20),
         },
         recent: state.decisions.slice(-20),
-        note: '切换真实性验证：headerAppends 为本进程追加的 request/header 次数；lastActual 为最近一步真实出网模型；decisions[].applied=true 且 swapped=true 即真实切换成功',
+        note: '切换真实性验证：headerAppends 为本进程追加的 request/header 次数；stepSwitches 为步骤级升级/降级次数（stepLog 有明细）；lastActual 为最近一步真实出网模型',
       }
     },
   })

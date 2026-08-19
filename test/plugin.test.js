@@ -8,10 +8,12 @@ import { join } from 'node:path'
 import { apply, name, inject } from '../dsh/index.js'
 import { Store } from '../dsh/store.js'
 
-// 会话 mock：requestHeader 反映最近追加的 header（模拟真实 fold 行为）
+// 会话 mock：requestHeader 反映最近追加的 header（模拟真实 fold 行为）；
+// deriveMessages 返回可注入的最后一条 assistant 消息（供步骤级路由 v1.5.0 读取工具调用）
 function mockSession(id, startModel = 'deepseek-v4-pro') {
   let model = startModel
   const events = []
+  let lastAssistant = null
   return {
     id,
     events,
@@ -23,6 +25,11 @@ function mockSession(id, startModel = 'deepseek-v4-pro') {
     },
     requestHeader() {
       return { config: { provider: 'deepseek-official', model }, adapterDefaults: {} }
+    },
+    setLastAssistant(blocks) { lastAssistant = { role: 'assistant', content: blocks } },
+    deriveMessages() {
+      const base = [{ role: 'user', content: [{ type: 'text', text: 'u' }] }]
+      return lastAssistant ? [...base, lastAssistant] : base
     },
   }
 }
@@ -159,6 +166,49 @@ test('v1.4.2：UCB 不探索无候选的 mid 档——简单任务决策里 recs
     assert.ok(!String(d.recs.ucb).startsWith('mid'), 'UCB 不得推荐 mid，实际 ' + d.recs.ucb)
     assert.ok(!String(d.recs.lin).startsWith('mid'), 'LinUCB 不得推荐 mid，实际 ' + d.recs.lin)
   }
+})
+
+test('v1.5.0 步骤级路由：重型工具调用 → 下一步升级 pro；轻量工具 → 回到回合基线 flash', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-router-step-'))
+  const ctx = mockCtx()
+  apply(ctx, { home, mode: 'active' })
+  const inbox = ctx.listeners['agent/inbox/claimed']
+  const preStep = ctx.listeners['agent/pre-step']
+  assert.ok(inbox && preStep)
+
+  const session = mockSession('s1', 'deepseek-v4-flash') // 当前 flash
+  const P = (t, text) => ({ agent: { sessionId: 's1', session }, turn: t, step: 1, signal: {}, message: { role: 'user', content: [{ type: 'text', text }] } })
+  const PRE = (t, s) => ({ agent: { sessionId: 's1', session }, turn: t, step: s, signal: {}, messages: [] })
+  const headers = () => session.events.filter((e) => e.type === 'request/header')
+
+  // 回合基线：简单问答 → flash（已是 flash，不追加）
+  inbox(P(1, QA_TASK))
+  assert.equal(headers().length, 0, '简单回合基线 flash，无需追加')
+
+  // 上一步是纯文本（回合收尾）→ 步骤级不动
+  session.setLastAssistant([{ type: 'text', text: 'ok' }])
+  preStep(PRE(1, 2), async () => ({}))
+  assert.equal(headers().length, 0, '纯文本步骤保持现状')
+
+  // 上一步发起重型工具调用（write）→ 下一步升级 pro
+  session.setLastAssistant([{ type: 'tool-call', id: 'c1', name: 'write', arguments: '{}' }])
+  preStep(PRE(1, 3), async () => ({}))
+  const h1 = headers()
+  assert.equal(h1.length, 1, '重型工具后应追加 header')
+  assert.equal(h1[0].data.header.config.model, 'deepseek-v4-pro', '应升级到 pro')
+  assert.equal(h1[0].data.reason, 'router-step', '步骤级切换 reason 应为 router-step')
+
+  // 上一步转轻量工具（read）→ 下一步回到基线 flash（降级）
+  session.setLastAssistant([{ type: 'tool-call', id: 'c2', name: 'read', arguments: '{}' }])
+  preStep(PRE(1, 4), async () => ({}))
+  const h2 = headers()
+  assert.equal(h2.length, 2, '轻量工具后应追加 header 降回 flash')
+  assert.equal(h2[1].data.header.config.model, 'deepseek-v4-flash', '应降回 flash')
+
+  // stats 可见步骤级记录
+  const stats = await ctx.registered.find((t) => t.name === 'agentic_router_stats').execute({}, {})
+  assert.equal(stats.stepSwitches, 2, '应记录 2 次步骤级切换')
+  assert.equal(stats.stepLog.length, 2)
 })
 
 test('兜底路径：request 决策 + llm/stream 延迟应用（中途热加载场景）', async () => {
