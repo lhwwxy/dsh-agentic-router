@@ -38,7 +38,27 @@ DeepSeek Harness（DSH）插件：**学习型智能路由（agentic router）+ �
 dsh plugin --profile web add dsh-agentic-router
 ```
 
-> `--profile` 必填。安装后重启会话（或 profile），工具 schema 才会进入 prompt 组装。默认 **shadow 模式**（只记录与学习，不切换模型），确认策略表现后再切 active（`agentic_router_set_mode`，或安装时传 `config.mode: 'active'`）。
+> `--profile` 必填。安装后重启 Web，工具 schema 才会进入 prompt 组装。
+
+### 切换到真实切换（active）
+
+默认是 **shadow 模式**（只记录与学习，不切换模型）。切到真实切换，最省事的方式：重启后在任意 DSH 会话里对 agent 说：
+
+> 把 agentic router 切成 active 模式
+
+agent 会调用 `agentic_router_set_mode`（mode=active），并把模式持久化到
+`~/.dsh/storages/dsh-agentic-router/policy.json`——**重启后依然 active**，无需每次设置。
+
+也可以不走会话、首次启动即 active：在 profile 的 `cordis.patch.yml` 里给
+`agentic-router` 条目加配置：
+
+```yaml
+- id: agentic-router
+  config:
+    mode: active
+```
+
+（两种方式选其一；一旦用工具存过模式，`policy.json` 的取值优先于 `config.mode`。）
 
 ## 切换机制（v1.4.0）
 

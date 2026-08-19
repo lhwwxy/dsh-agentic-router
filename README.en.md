@@ -32,7 +32,26 @@ Design rationale and roadmap: [docs/DESIGN.md](./docs/DESIGN.md). The implementa
 dsh plugin --profile web add dsh-agentic-router
 ```
 
-> `--profile` is mandatory. Restart the session (or profile) after installing so the tool schemas join prompt assembly. Default mode is **shadow** (records and learns, never swaps); switch to active once the policy behaves.
+> `--profile` is mandatory. Restart the web profile after installing so the tool schemas join prompt assembly.
+
+### Switch to real routing (active)
+
+Default mode is **shadow** (records and learns, never swaps). To enable real switching, the easiest way is: after restarting, tell the agent in any DSH session:
+
+> Switch the agentic router to active mode
+
+The agent calls `agentic_router_set_mode` (mode=active) and persists it to
+`~/.dsh/storages/dsh-agentic-router/policy.json` — it stays active across restarts.
+
+Alternatively, start active on first load by adding config in the profile's `cordis.patch.yml`:
+
+```yaml
+- id: agentic-router
+  config:
+    mode: active
+```
+
+(Pick one; once a mode has been saved via the tool, `policy.json` takes precedence over `config.mode`.)
 
 ## Tools
 
