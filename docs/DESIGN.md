@@ -226,3 +226,40 @@ dsh-agentic-router/
 - 离线回放：拿历史 session 日志重放，对比 shadow 路由与实际路由的评分分布
 - 影子期 A/B：shadow 评分 vs 默认路由评分，达标才切 active
 - 集成冒烟：mock ctx 注入 agent/request payload，验证 LlmCallConfig 替换与 next() 透传
+
+---
+
+## 13. v1.5.0 步骤级路由设计（已实现）
+
+### 13.1 动机
+
+回合级路由（v1.4.x）每回合决策一次、整回合同一模型。用户期望"单任务内简单步骤用 flash、复杂步骤用 pro"。步骤级路由在回合级基线之上做**按步骤升降档**。
+
+### 13.2 时序依据（为什么对下一步生效）
+
+loop 每步顺序：`inbox.claim()`（发 `agent/inbox/claimed`）→ `systemPrompt.assemble()`（快照模型）→ `agent/pre-step` waterfall → `buildRequest`。因此：
+
+- **inbox 决策**在组装之前 → 回合第一步即生效（零延迟，v1.4.x 主路径）
+- **pre-step 决策**在组装之后 → 追加 header 对**下一步**生效（一阶延迟，设计如此）
+
+### 13.3 信号：上一步的工具调用
+
+`session.deriveMessages()` 取最后一条 assistant 消息的 `tool-call` 块（只读叶子字段）：
+
+| 上一步工具 | 下一步档位 |
+|---|---|
+| 重型：bash/pwsh/write/edit/batch_edit/run_code/workflow/subagent/subagent_fork/terminal/pty/mcp | **strong（pro）** |
+| 轻量：read/glob/grep 等 | 回合基线档 |
+| 无工具（纯文本，通常回合收尾） | 保持现状 |
+
+### 13.4 决策与落盘
+
+- 步骤档位 → `resolveTier` → 目标模型 ≠ 当前模型 → 追加 `request/header`（reason: `router-step`）
+- 每步一条 `steps.jsonl`：`{turn, step, lastTools, stepTier, target, current, applied}`
+- stats 暴露 `stepSwitches` 与 `stepLog`（最近 20 条）
+
+### 13.5 边界与后续
+
+- 奖励飞轮仍按回合结算（回合基线的策略选择），步骤级是确定性规则；未来可把步骤级升降档纳入学习（如按工具调用频率学阈值）
+- 重型集合 `HEAVY_TOOLS` 是静态清单，可配置化
+- 降级方向：重型步骤后的轻量步骤会回到基线（简单任务场景：写代码阶段 pro、前后问答 flash）
