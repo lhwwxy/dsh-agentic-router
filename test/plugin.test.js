@@ -170,16 +170,22 @@ test('v1.4.2：UCB 不探索无候选的 mid 档——简单任务决策里 recs
 
 test('v1.5.0 步骤级路由：重型工具调用 → 下一步升级 pro；轻量工具 → 回到回合基线 flash', async () => {
   const home = mkdtempSync(join(tmpdir(), 'dsh-router-step-'))
-  const ctx = mockCtx()
+  const session = mockSession('s1', 'deepseek-v4-flash') // 当前 flash
+  const sessions = new Map([['s1', session]])
+  const ctx = mockCtx({ sessions })
   apply(ctx, { home, mode: 'active' })
   const inbox = ctx.listeners['agent/inbox/claimed']
   const preStep = ctx.listeners['agent/pre-step']
-  assert.ok(inbox && preStep)
+  const stream = ctx.listeners['llm/stream']
+  assert.ok(inbox && preStep && stream)
 
-  const session = mockSession('s1', 'deepseek-v4-flash') // 当前 flash
   const P = (t, text) => ({ agent: { sessionId: 's1', session }, turn: t, step: 1, signal: {}, message: { role: 'user', content: [{ type: 'text', text }] } })
   const PRE = (t, s) => ({ agent: { sessionId: 's1', session }, turn: t, step: s, signal: {}, messages: [] })
   const headers = () => session.events.filter((e) => e.type === 'request/header')
+  const drain = async (sid) => {
+    const w = stream({ sessionId: sid, provider: 'deepseek-official' }, async function* () { yield { type: 'finish', reason: 'stop' } })
+    for await (const c of w) { /* drain */ }
+  }
 
   // 回合基线：简单问答 → flash（已是 flash，不追加）
   inbox(P(1, QA_TASK))
@@ -190,17 +196,21 @@ test('v1.5.0 步骤级路由：重型工具调用 → 下一步升级 pro；轻�
   preStep(PRE(1, 2), async () => ({}))
   assert.equal(headers().length, 0, '纯文本步骤保持现状')
 
-  // 上一步发起重型工具调用（write）→ 下一步升级 pro
+  // 上一步发起重型工具调用（write）→ 挂起升级 pro（pre-step 不直接追加，避免被 buildRequest 覆盖）
   session.setLastAssistant([{ type: 'tool-call', id: 'c1', name: 'write', arguments: '{}' }])
   preStep(PRE(1, 3), async () => ({}))
+  assert.equal(headers().length, 0, 'pre-step 只挂起，不直接追加（防竞态）')
+  // 本步流结束（loop header 已落盘）→ 延迟追加 pro
+  await drain('s1')
   const h1 = headers()
-  assert.equal(h1.length, 1, '重型工具后应追加 header')
+  assert.equal(h1.length, 1, 'llm/stream 收尾应追加 header')
   assert.equal(h1[0].data.header.config.model, 'deepseek-v4-pro', '应升级到 pro')
   assert.equal(h1[0].data.reason, 'router-step', '步骤级切换 reason 应为 router-step')
 
-  // 上一步转轻量工具（read）→ 下一步回到基线 flash（降级）
+  // 上一步转轻量工具（read）→ 挂起降回基线 flash
   session.setLastAssistant([{ type: 'tool-call', id: 'c2', name: 'read', arguments: '{}' }])
   preStep(PRE(1, 4), async () => ({}))
+  await drain('s1')
   const h2 = headers()
   assert.equal(h2.length, 2, '轻量工具后应追加 header 降回 flash')
   assert.equal(h2[1].data.header.config.model, 'deepseek-v4-flash', '应降回 flash')

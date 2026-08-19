@@ -480,12 +480,12 @@ export function apply(ctx, config = {}) {
       const target = resolved.target
       const cur = currentModel(session)
       const changed = target && target !== cur
-      if (changed) {
-        const ok = appendRouterHeader(session, target, 'router-step')
-        if (ok) state.counters.stepSwitches++
-        if (ok) log('STEP-SWAP -> ' + target + ' (tools: ' + tools.slice(0, 5).join(',') + ')')
-      }
-      const stepRec = { turn: key, step: payload.step, lastTools: tools.slice(0, 5), stepTier, target, current: cur, applied: changed, ts: Date.now() }
+      // 注意：pre-step 在组装之后、buildRequest（loop 追加自己的 header）之前触发。
+      // 这里直接追加会被本步 buildRequest 的 change(旧模型) 覆盖（与 v1.4.0 冷启动同款竞态）。
+      // 因此只决策并挂起，真正追加推迟到 llm/stream 收尾（此时 loop 的 header 已落盘）。
+      if (changed) td.stepTarget = target
+      const stepRec = { turn: key, step: payload.step, lastTools: tools.slice(0, 5), stepTier, target, current: cur, applied: false, pending: changed, ts: Date.now() }
+      if (changed) td.stepRec = stepRec
       state.stepLog.push(stepRec)
       if (state.stepLog.length > 30) state.stepLog.shift()
       try { store.appendJsonl('steps.jsonl', stepRec) } catch (e) { /* 落盘尽力而为 */ }
@@ -562,14 +562,25 @@ export function apply(ctx, config = {}) {
           const key = sid ? state.openTurns.get(sid) : null
           const td = key ? state.turnDecision[key] : null
           if (td && !td.finalized) {
-            // 兜底应用：request 路径决策未应用时，在 header 落盘后补切换
-            if (td.needsApply && !td.applied) {
-              let session = null
-              try {
-                const sessions = ctx.get('sessions')
-                if (sessions && typeof sessions.get === 'function') session = sessions.get(sid) || null
-              } catch (e) { session = null }
-              if (session) applyDecision(session, key, td, td.rec, td.target)
+            // 延迟应用（此时循环自身 header 已落盘，追加无竞态）：
+            // 1) 步骤级路由挂起的升降档（router-step）
+            // 2) request 路径兜底决策（needsApply）
+            let session = null
+            try {
+              const sessions = ctx.get('sessions')
+              if (sessions && typeof sessions.get === 'function') session = sessions.get(sid) || null
+            } catch (e) { session = null }
+            if (session) {
+              if (td.stepTarget && td.stepTarget !== currentModel(session)) {
+                const ok = appendRouterHeader(session, td.stepTarget, 'router-step')
+                if (ok) {
+                  state.counters.stepSwitches++
+                  if (td.stepRec) { td.stepRec.applied = true }
+                  log('STEP-SWAP -> ' + td.stepTarget + (td.stepRec ? ' (tools: ' + td.stepRec.lastTools.join(',') + ')' : ''))
+                }
+              }
+              td.stepTarget = null
+              if (td.needsApply && !td.applied) applyDecision(session, key, td, td.rec, td.target)
             }
             const u = td.usage || { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, reasoningTokens: 0, estimated: false }
             const model = (options && typeof options.model === 'string' && options.model) || td.currentModel || ''
