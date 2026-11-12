@@ -43,6 +43,14 @@ function mockCtx(opts = {}) {
   const listeners = {}
   const registered = []
   const providers = opts.providers || [{ id: 'deepseek-official', models: ['deepseek-flash', 'deepseek-v4-pro'] }]
+  const llm = {
+    async listProviders() { return providers },
+    async listModels(pid) {
+      if (opts.slowModels) return new Promise(() => {}) // 永不 resolve：模拟档位表加载未完成
+      const p = providers.find((x) => (x.id || x.name || x.provider) === pid)
+      return (p ? p.models : []).map((id) => ({ id }))
+    },
+  }
   return {
     listeners,
     registered,
@@ -50,16 +58,7 @@ function mockCtx(opts = {}) {
       if (k === 'tools') {
         return { register: (def) => { registered.push(def); return () => {} } }
       }
-      if (k === 'llm') {
-        return {
-          async listProviders() { return providers },
-          async listModels(pid) {
-            if (opts.slowModels) return new Promise(() => {}) // 永不 resolve：模拟档位表加载未完成
-            const p = providers.find((x) => (x.id || x.name || x.provider) === pid)
-            return (p ? p.models : []).map((id) => ({ id }))
-          },
-        }
-      }
+      if (k === 'llm') return llm
       if (k === 'messageFeedback') return opts.mf
       if (k === 'timer') return opts.timer
       if (k === 'sessions') return opts.sessions
@@ -76,6 +75,8 @@ function payload(sessionId, turn, session) {
 
 const CODE_TASK = '重构下面这段 Python 代码，使其支持多线程并发执行并安全处理异常：\n\n```python\nimport time\ndef fetch(url):\n    time.sleep(1)\n```'
 const QA_TASK = '请只用一句话回答：地球的天然卫星叫什么？'
+// 等一个宏任务：让启动探测（微任务链）完成，模型目录就绪
+const tick = () => new Promise((r) => setTimeout(r, 0))
 
 test('插件声明', () => {
   assert.equal(name, 'agentic-router')
@@ -86,11 +87,12 @@ test('v1.4.0 机制：inbox 决策并追加 request/header 真实切换（shadow
   const home = mkdtempSync(join(tmpdir(), 'dsh-router-'))
   const ctx = mockCtx()
   apply(ctx, { home })
+  await tick()
   const inbox = ctx.listeners['agent/inbox/claimed']
   const req = ctx.listeners['agent/request']
   const stop = ctx.listeners['agent/turn-stopping']
   assert.ok(inbox && req && stop, '事件监听应全部挂载')
-  assert.equal(ctx.registered.length, 5, '应注册 5 个工具')
+  assert.equal(ctx.registered.length, 6, '应注册 6 个工具')
 
   const session = mockSession('s1')
   const P = (t, text) => ({ agent: { sessionId: 's1', session }, turn: t, step: 1, signal: {}, message: { role: 'user', content: [{ type: 'text', text }] } })
@@ -137,28 +139,46 @@ test('v1.4.0 机制：inbox 决策并追加 request/header 真实切换（shadow
   assert.equal(stats.lastActual.model, 'deepseek-v4-pro')
 })
 
-test('冷启动：档位表异步加载未完成时，inbox 仍用兜底档位立即切换（v1.4.1 修复）', async () => {
-  const home = mkdtempSync(join(tmpdir(), 'dsh-router-coldstart-'))
-  const ctx = mockCtx({ slowModels: true }) // listModels 永不 resolve，模拟冷启动
+test('冷启动：读上次探测的本地缓存（models.json）即可立即决策切换，不依赖本次探测（v1.6.1）', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-router-catalog-cache-'))
+  new Store(home).saveModels({
+    ts: Date.now(),
+    providers: [{ provider: 'deepseek-official', models: ['deepseek-flash', 'deepseek-v4-pro'] }],
+    tiers: { fast: ['deepseek-official/deepseek-flash'], mid: [], strong: ['deepseek-official/deepseek-v4-pro'] },
+  })
+  const ctx = mockCtx({ slowModels: true }) // 本次探测永不完成，只有缓存可用
   apply(ctx, { home, mode: 'active' })
-  const inbox = ctx.listeners['agent/inbox/claimed']
-  assert.ok(inbox)
-
   const session = mockSession('s1') // 当前 pro
   const P = (t, text) => ({ agent: { sessionId: 's1', session }, turn: t, step: 1, signal: {}, message: { role: 'user', content: [{ type: 'text', text }] } })
 
-  // inbox 是同步的：调用后立即断言，不等待任何异步档位表加载
-  inbox(P(1, QA_TASK))
+  ctx.listeners['agent/inbox/claimed'](P(1, QA_TASK))
   const appends = session.events.filter((e) => e.type === 'request/header')
-  assert.equal(appends.length, 1, '冷启动下也应立即追加 header')
-  assert.equal(appends[0].data.header.config.model, 'deepseek-flash', '兜底档位表应把简单问答切到 flash')
+  assert.equal(appends.length, 1, '有本地缓存时冷启动也应立即切换')
+  assert.equal(appends[0].data.header.config.model, 'deepseek-flash', '缓存档位应把简单问答切到 flash')
   assert.equal(appends[0].data.reason, 'router')
+})
+
+test('新装无缓存：探测未就绪时不切换也不报错——绝不使用写死的模型清单（v1.6.1）', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-router-catalog-empty-'))
+  const ctx = mockCtx({ slowModels: true })
+  apply(ctx, { home, mode: 'active' })
+  const session = mockSession('s1')
+  const P = (t, text) => ({ agent: { sessionId: 's1', session }, turn: t, step: 1, signal: {}, message: { role: 'user', content: [{ type: 'text', text }] } })
+
+  ctx.listeners['agent/inbox/claimed'](P(1, QA_TASK))
+  assert.equal(session.events.filter((e) => e.type === 'request/header').length, 0, '无目录时不得切换')
+  const decisions = new Store(home).loadJsonl('decisions.jsonl')
+  assert.equal(decisions.length, 1, '照常记录决策')
+  assert.equal(decisions[0].targetModel, null)
+  const stats = await ctx.registered.find((t) => t.name === 'agentic_router_stats').execute({}, {})
+  assert.equal(stats.modelCatalog.source, 'empty', 'stats 透明标注目录来源')
 })
 
 test('v1.4.2：UCB 不探索无候选的 mid 档——简单任务决策里 recs.ucb 不得为 mid', async () => {
   const home = mkdtempSync(join(tmpdir(), 'dsh-router-notier-'))
   const ctx = mockCtx() // 档位表只有 flash/pro（fast/strong），mid 无候选
   apply(ctx, { home, mode: 'active' })
+  await tick()
   const inbox = ctx.listeners['agent/inbox/claimed']
   const session = mockSession('s1')
   const P = (t, text) => ({ agent: { sessionId: 's1', session }, turn: t, step: 1, signal: {}, message: { role: 'user', content: [{ type: 'text', text }] } })
@@ -181,6 +201,7 @@ test('v1.5.0 步骤级路由：重型工具调用 → 下一步升级 pro；轻�
   const sessions = new Map([['s1', session]])
   const ctx = mockCtx({ sessions })
   apply(ctx, { home, mode: 'active' })
+  await tick()
   const inbox = ctx.listeners['agent/inbox/claimed']
   const preStep = ctx.listeners['agent/pre-step']
   const stream = ctx.listeners['llm/stream']
@@ -234,6 +255,7 @@ test('兜底路径：request 决策 + llm/stream 延迟应用（中途热加载�
   const sessions = new Map([['s1', session]])
   const ctx = mockCtx({ sessions })
   apply(ctx, { home, mode: 'active' })
+  await tick()
   const pre = ctx.listeners['agent/pre-step']
   const req = ctx.listeners['agent/request']
   const stream = ctx.listeners['llm/stream']
@@ -478,6 +500,7 @@ test('v1.6.0 force：钉死模型，步骤级路由不再覆盖', async () => {
   const agents = { list() { return [{ session }] } }
   const ctx = mockCtx({ sessions, agents })
   apply(ctx, { home, mode: 'active' })
+  await tick()
   const inbox = ctx.listeners['agent/inbox/claimed']
   const preStep = ctx.listeners['agent/pre-step']
   const stream = ctx.listeners['llm/stream']
@@ -507,6 +530,7 @@ test('v1.6.0 首回合延迟决策：inbox 无 header → 首个 request 拿到 
   const sessions = new Map([['s1', session]])
   const ctx = mockCtx({ sessions })
   apply(ctx, { home, mode: 'active' })
+  await tick()
   const inbox = ctx.listeners['agent/inbox/claimed']
   const req = ctx.listeners['agent/request']
   const stream = ctx.listeners['llm/stream']
@@ -576,4 +600,70 @@ test('v1.6.0 价格合并：内置 deepseek-account 价对旧 policy 生效', as
   assert.ok(stats.prices['deepseek-account'], '应合并出 deepseek-account 内置价')
   assert.equal(stats.prices['deepseek-account']['deepseek-flash'].in, 0.2)
   assert.equal(stats.prices['deepseek-official']['deepseek-v4-flash'].in, 0.2, '旧 policy 覆盖保留')
+})
+
+test('模型目录：启动探测结果落盘 models.json（运行时探测 + 本地缓存）', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-router-catalog-persist-'))
+  const ctx = mockCtx({
+    providers: [
+      { id: 'deepseek-account', models: ['deepseek-flash', 'deepseek-v4-pro'] },
+      { id: 'lynxtoncloud', models: ['glm-5.3'] },
+    ],
+  })
+  apply(ctx, { home, mode: 'active' })
+  await tick()
+  const cat = new Store(home).loadModels()
+  assert.ok(cat, '探测结果应写入 models.json')
+  assert.equal(cat.providers.length, 2, '应按实际 provider 数量持久化')
+  assert.deepEqual(cat.providers.map((p) => p.provider).sort(), ['deepseek-account', 'lynxtoncloud'])
+  assert.ok(cat.tiers.mid.includes('lynxtoncloud/glm-5.3'), 'glm-5.3 归入 mid')
+  assert.ok(cat.ts > 0, '带探测时间戳')
+})
+
+test('模型目录：provider 被删除后手动刷新立即剔除（模拟 zai 下线）', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-router-catalog-refresh-'))
+  const ctx = mockCtx({
+    providers: [
+      { id: 'deepseek-account', models: ['deepseek-flash', 'deepseek-v4-pro'] },
+      { id: 'zai-coding-cn', models: ['glm-4.6v', 'glm-5.3'] },
+    ],
+  })
+  apply(ctx, { home, mode: 'active' })
+  await tick()
+  let stats = await ctx.registered.find((t) => t.name === 'agentic_router_stats').execute({}, {})
+  assert.ok(stats.modelTiers.providers.some((p) => p.provider === 'zai-coding-cn'), '初始含 zai')
+  const refresh = ctx.registered.find((t) => t.name === 'agentic_router_refresh_models')
+  assert.ok(refresh, '应注册刷新工具')
+
+  // 用户删掉 zai provider
+  const llm = ctx.get('llm')
+  const orig = llm.listProviders
+  llm.listProviders = async () => [{ id: 'deepseek-account', models: ['deepseek-flash', 'deepseek-v4-pro'] }]
+
+  const r = await refresh.execute({}, {})
+  assert.ok(r.ok, '刷新成功')
+  assert.equal(r.changed, true, '目录发生变化')
+  assert.equal(r.modelTiers.providers.length, 1, 'zai 已剔除')
+  assert.equal(r.modelTiers.tiers.mid.length, 0, 'zai 的 mid 模型随之剔除')
+  const cat = new Store(home).loadModels()
+  assert.equal(cat.providers.length, 1, '本地缓存同步剔除 zai')
+  stats = await ctx.registered.find((t) => t.name === 'agentic_router_stats').execute({}, {})
+  assert.equal(stats.modelCatalog.source, 'live')
+  llm.listProviders = orig
+})
+
+test('模型目录：TTL 到期后 request 路径自动重探（惰性刷新）', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-router-catalog-ttl-'))
+  let calls = 0
+  const ctx = mockCtx()
+  const llm = ctx.get('llm')
+  const orig = llm.listProviders
+  llm.listProviders = async () => { calls += 1; return orig() }
+  apply(ctx, { home, mode: 'active', tiersTtlMs: 0 }) // TTL=0 → 每步都过期
+  await tick()
+  const startupCalls = calls
+  assert.ok(startupCalls >= 1, '启动已探测')
+  await ctx.listeners['agent/request'](payload('s1', 1), async () => ({ provider: 'deepseek-official', model: 'deepseek-v4-pro' }))
+  await tick()
+  assert.ok(calls > startupCalls, 'TTL 过期触发后台重探，不阻塞 request')
 })

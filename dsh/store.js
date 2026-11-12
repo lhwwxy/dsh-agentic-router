@@ -62,6 +62,35 @@ export class Store {
     }
   }
 
+  // ---- 模型目录（运行时探测结果的本地缓存）----
+  // 插件不在代码里写死任何模型清单：每次探测 llm.listProviders()/listModels() 后
+  // 落到 models.json，重启后先读本地缓存，再按 TTL / 手动刷新重新探测。
+  modelsPath() { return join(this.home, 'models.json') }
+
+  loadModels() {
+    try {
+      if (!existsSync(this.modelsPath())) return null
+      const c = JSON.parse(readFileSync(this.modelsPath(), 'utf8'))
+      if (!c || !Array.isArray(c.providers) || !c.tiers) return null
+      return c
+    } catch {
+      return null
+    }
+  }
+
+  saveModels(catalog) {
+    const p = this.modelsPath()
+    mkdirSync(dirname(p), { recursive: true })
+    const tmp = p + '.tmp'
+    writeFileSync(tmp, JSON.stringify(catalog, null, 2))
+    renameSync(tmp, p)
+  }
+
+  clearModels() {
+    const p = this.modelsPath()
+    if (existsSync(p)) writeFileSync(p, '')
+  }
+
   listFiles() {
     try { return readdirSync(this.home) } catch { return [] }
   }

@@ -26,6 +26,12 @@ DeepSeek Harness（DSH）插件：**学习型智能路由（agentic router）+ �
 provider 后再决策应用；`agentic_router_force` 钉死模型、步骤级路由不再覆盖；内置价表补齐
 `deepseek-account`，并在加载时与旧 `policy.json` 价格合并。可用配置 `crossProvider: false` 关闭跨 provider。
 
+**v1.6.1 模型目录运行时探测 + 本地缓存**：插件**不在代码里写死任何模型清单**。启动与运行中
+通过 `llm.listProviders()/listModels()` 探测 DSH 实际的 provider/模型，写入本地 `models.json`；
+重启先读缓存（冷启动即可决策），再重新探测覆盖。刷新时机：启动、每回合 request 的 TTL 惰性检查
+（默认 10 分钟）、请求出错（自愈已下线模型）、`agentic_router_refresh_models` 手动刷新。
+`agentic_router_stats` 的 `modelCatalog` 透明标注目录来源（live/cache/empty）与探测时间。
+
 ## 架构
 
 ```

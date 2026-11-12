@@ -37,21 +37,13 @@ const LIN_GRADUATION = 50   // LinUCB 毕业样本线
 const KNN_GRADUATION = 30   // k-NN 毕业经验线
 const SETTLE_DELAY_MS = 45000 // 反馈结算窗口：回合结束 45s 后查询 messageFeedback
 const SWEEP_MS = 15000        // 结算轮询周期
+const TIERS_TTL_MS = 600000   // 模型目录 TTL：默认 10 分钟自动重新探测（provider/模型增删自愈）
 
-// 同步兜底档位表：从 DEFAULT_PRICES 已知的 provider→model 推导档位，
-// 让插件在 llm.listModels 异步加载完成之前也能立即决策与切换（不 await、不延期）。
-// 加载完成后由 refreshModelTiers 用权威目录覆盖。
-function fallbackTiers() {
-  const tiers = { fast: [], mid: [], strong: [] }
-  const providers = []
-  for (const provider of Object.keys(DEFAULT_PRICES)) {
-    if (provider === '*') continue
-    const models = Object.keys(DEFAULT_PRICES[provider] || {})
-    if (!models.length) continue
-    providers.push({ provider, models })
-    for (const n of models) tiers[tierOf(n)].push(provider + '/' + n)
-  }
-  return { providers, tiers }
+// 空档位表：插件不在代码里写死任何模型清单。启动时优先读本地缓存（models.json，
+// 上一次运行时探测的结果），无缓存则为空表——此时照常记录决策但不切换，
+// 等 llm 探测（启动/手动/TTL/请求出错）完成后立即恢复决策能力。
+function emptyTiers() {
+  return { providers: [], tiers: { fast: [], mid: [], strong: [] } }
 }
 
 // 当前 provider 有候选模型的档位列表（UCB/LinUCB/k-NN 只在这些档位间探索）。
@@ -76,7 +68,11 @@ function freshState() {
     forced: null,
     crossProvider: true,
     pending: new Map(),
-    modelTiers: fallbackTiers(),
+    modelTiers: emptyTiers(),
+    catalogTs: null,
+    catalogSource: 'empty',
+    probing: false,
+    lastProbeAt: 0,
     turnDecision: {},
     openTurns: new Map(),
     pendingFeedback: [],
@@ -272,6 +268,7 @@ async function refreshModelTiers(llm) {
 }
 
 export function apply(ctx, config = {}) {
+  const log = (msg) => console.log('[agentic-router]', msg)
   const tools = ctx.get('tools')
   const llm = ctx.get('llm')
   const mf = ctx.get('messageFeedback')
@@ -289,6 +286,48 @@ export function apply(ctx, config = {}) {
   state.mode = policy.mode || config.mode || 'shadow'
   state.crossProvider = crossProvider
   if (typeof policy.forced === 'string') state.forced = policy.forced
+
+  // 模型目录：不写死。先读上次探测的本地缓存（models.json），没有则为空表。
+  // 缓存里的 provider 可能已被删除——可用性以本次 llm 探测为准，所以启动时无条件重探。
+  const cached = store.loadModels()
+  if (cached) {
+    state.modelTiers = { providers: cached.providers, tiers: cached.tiers }
+    state.catalogTs = typeof cached.ts === 'number' ? cached.ts : null
+    state.catalogSource = 'cache'
+    log('model catalog from cache: ' + cached.providers.length + ' providers (ts=' + cached.ts + ')')
+  }
+  const tiersTtlMs = typeof config.tiersTtlMs === 'number' ? config.tiersTtlMs : TIERS_TTL_MS
+
+  // 探测：并发保护 + TTL + 失败保留旧缓存。成功后覆盖 state 并落盘 models.json。
+  async function probeCatalog(reason) {
+    if (state.probing) return null
+    state.probing = true
+    state.lastProbeAt = Date.now() // 无论成败都算"尝试过"，TTL 内不再重试，避免失败风暴
+    try {
+      const t = await refreshModelTiers(llm)
+      if (t && t.providers.length) {
+        state.modelTiers = t
+        state.catalogTs = state.lastProbeAt
+        state.catalogSource = 'live'
+        try { store.saveModels({ ts: state.catalogTs, providers: t.providers, tiers: t.tiers }) } catch {}
+        log('model catalog probed (' + reason + '): ' + t.providers.length + ' providers, tiers fast=' + t.tiers.fast.length + ' mid=' + t.tiers.mid.length + ' strong=' + t.tiers.strong.length)
+        return t
+      }
+      log('model catalog probe empty (' + reason + '), keep cached')
+      return null
+    } catch (e) {
+      log('model catalog probe failed (' + reason + '): ' + String(e))
+      return null
+    } finally {
+      state.probing = false
+    }
+  }
+  // TTL 惰性刷新：回合内每步 request 路径都会检查，过期则后台重探（不阻塞决策）。
+  function maybeRefreshCatalog() {
+    if (state.probing) return
+    const stale = !state.catalogTs || (Date.now() - (state.lastProbeAt || 0) > tiersTtlMs)
+    if (stale) probeCatalog('ttl').catch(() => {})
+  }
 
   // 飞轮恢复：重放 rewards.jsonl 重建 UCB/LinUCB/k-NN/EXP3；
   // feedback-settle 行在基础奖励重放后按 turn 精确修正
@@ -310,7 +349,6 @@ export function apply(ctx, config = {}) {
   state.decisions = store.loadJsonl('decisions.jsonl').slice(-60)
   state.seq = state.decisions.length ? state.decisions[state.decisions.length - 1].seq : 0
 
-  const log = (msg) => console.log('[agentic-router]', msg)
   if (rewards.length) log('replayed ' + rewards.length + ' rewards; ucb.total=' + state.ucb.total)
 
   let mfWarned = false
@@ -359,8 +397,8 @@ export function apply(ctx, config = {}) {
 
   // ---- 决策流水线（inbox 与 request 兜底共用） ----
   // 返回 { key, td, record, target }；已决策过本回合则返回 null。
-  // 必须同步执行：档位表用 fallbackTiers() 兜底（见 freshState），
-  // 不 await、不延期——否则追加 header 会落到 prompt 组装之后，被 loop 覆盖。
+  // 必须同步执行：模型目录来自本地缓存/运行时探测（见 freshState 与 probeCatalog），
+  // 目录未就绪时照常记录决策但不切换，不 await、不延期——否则追加 header 会落到 prompt 组装之后。
   function decideAndRecord(payload, text, current, provider, source) {
     const key = fullKey(payload)
     if (state.turnDecision[key]) return null
@@ -531,6 +569,7 @@ export function apply(ctx, config = {}) {
     if (!cfg || typeof cfg !== 'object') return cfg
     try {
       if (!timer || typeof timer.interval !== 'function') settleFeedback().catch(() => {})
+      maybeRefreshCatalog() // TTL 惰性刷新模型目录（不阻塞决策）
       const key = fullKey(payload)
       const model = typeof cfg.model === 'string' ? cfg.model : null
       const provider = typeof cfg.provider === 'string' ? cfg.provider : ''
@@ -581,6 +620,8 @@ export function apply(ctx, config = {}) {
 
   ctx.on('agent/request-error', (payload, next) => {
     try {
+      // 请求失败（可能是模型/provider 已下线）→ 立即触发重探模型目录，及时剔除失效项
+      probeCatalog('request-error').catch(() => {})
       const td = state.turnDecision[fullKey(payload)]
       if (td && !td.finalized) {
         td.retries = (td.retries || 0) + 1
@@ -722,13 +763,9 @@ export function apply(ctx, config = {}) {
   ctx.on('agent/turn-stopping', (payload) => finalize(payload, 'clean-close'))
   ctx.on('agent/error', (payload) => finalize(payload, 'error'))
 
-  // 权威档位表异步加载，就绪后覆盖同步兜底表（fallbackTiers 保证首回合即可决策）。
-  // 仅在刷新成功时覆盖，避免把兜底表清成 null。
-  const tiersReady = refreshModelTiers(llm)
-  tiersReady.then((t) => {
-    if (t) state.modelTiers = t
-    log('model tiers: ' + JSON.stringify(t))
-  }).catch((e) => log('model tiers refresh failed: ' + String(e)))
+  // 启动即探测（无条件，确保删除的 provider 不会残留在缓存里）；
+  // 有缓存时缓存已用于启动决策，探测完成后覆盖；无缓存时首个 request 也会触发探测。
+  probeCatalog('startup').catch((e) => log('startup probe failed: ' + String(e)))
 
   // ---- 工具 ----
   const OUT = (label) => ({
@@ -757,8 +794,16 @@ export function apply(ctx, config = {}) {
         crossProvider: state.crossProvider,
         totalDecisions: state.seq,
         modelTiers: state.modelTiers,
+        modelCatalog: {
+          source: state.catalogSource, // live（刚探测）/ cache（本地 models.json）/ empty（无目录，等探测）
+          ts: state.catalogTs,
+          lastProbeAt: state.lastProbeAt || null,
+          probing: state.probing,
+          ttlMs: tiersTtlMs,
+          cacheFile: 'models.json',
+        },
         prices,
-        mechanism: 'request/header append (inbox turn-level + pre-step step-level v1.5.0)',
+        mechanism: 'request/header append (inbox turn-level + pre-step step-level v1.5.0; model catalog probed at runtime + cached locally)',
         lastActual: state.lastActual,
         headerAppends: state.headerAppends,
         stepSwitches: state.counters.stepSwitches,
@@ -866,6 +911,29 @@ export function apply(ctx, config = {}) {
     },
   })
   register({
+    name: 'agentic_router_refresh_models',
+    description: '重新探测当前 DSH 的 provider/模型目录，更新路由档位并落盘到本地 models.json（不写死模型清单；provider/模型增删后用它立即刷新，默认也会按 TTL 自动刷新）。',
+    parameters: { type: 'object', properties: {} },
+    output: OUT('agentic router 模型目录刷新'),
+    isConcurrencySafe: () => true,
+    async execute() {
+      const before = state.modelTiers
+      const t = await probeCatalog('manual')
+      const mt = t || state.modelTiers
+      return {
+        ok: !!t,
+        changed: JSON.stringify(before) !== JSON.stringify(state.modelTiers),
+        modelCatalog: {
+          source: state.catalogSource,
+          ts: state.catalogTs,
+          probing: state.probing,
+        },
+        modelTiers: mt,
+        note: '已按当前 DSH 实际 provider/模型重新探测并写入 models.json；被删除的 provider 不会保留',
+      }
+    },
+  })
+  register({
     name: 'agentic_router_reset',
     description: '清空飞轮学习状态（决策与奖励历史），保留当前模式；用于重新开始学习或清理测试数据。',
     parameters: { type: 'object', properties: {} },
@@ -885,6 +953,11 @@ export function apply(ctx, config = {}) {
       state.decisions = []
       state.headerAppends = 0
       state.lastActual = null
+      store.clearModels()
+      state.modelTiers = emptyTiers()
+      state.catalogTs = null
+      state.catalogSource = 'empty'
+      probeCatalog('reset').catch(() => {}) // 重置后立即重新探测模型目录
       return { reset: true, home: store.home }
     },
   })
