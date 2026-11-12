@@ -192,6 +192,22 @@ function currentProvider(session) {
   return c && typeof c.provider === 'string' ? c.provider : ''
 }
 
+// 会话是否"进行中"（存在未结束的 turn）。只有进行中的会话才允许追加换模型 header；
+// 空闲/回合已结束的会话一律不动——否则 header 会落在"回合外"，DSH 载入校验会拒掉整条会话。
+function turnOpen(session) {
+  try {
+    const events = session && typeof session.snapshotEvents === 'function' ? session.snapshotEvents() : []
+    let open = false
+    for (const e of events) {
+      if (e && e.type === 'turn/start') open = true
+      else if (e && e.type === 'turn/end') open = false
+    }
+    return open
+  } catch {
+    return false
+  }
+}
+
 // 核心切换：向会话日志追加 request/header（reason: 'router' / 'router-step'），
 // 下一轮 prompt 组装即读到新模型。fast/mid 档去掉 reasoningEffort，
 // 让目标模型走自身默认 effort（避免 flash 不支持 max 而整步失败）。
@@ -879,7 +895,7 @@ export function apply(ctx, config = {}) {
               for (const agent of agents.list()) {
                 try {
                   const session = sessionOf({ agent })
-                  if (session && currentModel(session) !== pf.model) {
+                  if (session && turnOpen(session) && currentModel(session) !== pf.model) {
                     const ok = appendRouterHeader(session, pf.model, 'change', pf.provider)
                     if (ok) state.headerAppends++
                   }
