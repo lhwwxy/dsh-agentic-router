@@ -5,6 +5,10 @@
   "type": "module",
   "license": "MIT",
   "author": "lhl",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lhwwxy/dsh-agentic-router.git"
+  },
   "engines": {
     "node": ">=22.19"
   },
