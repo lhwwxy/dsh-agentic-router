@@ -29,7 +29,12 @@ function mockSession(id, startModel = 'deepseek-v4-pro', opts = {}) {
     },
     requestHeader() {
       if (!hasHeader) return null
-      return { config: { provider, model }, adapterDefaults: {} }
+      const config = { provider, model }
+      if (opts.reasoningEffort !== undefined) config.reasoningEffort = opts.reasoningEffort
+      if (opts.maxTokens !== undefined) config.maxTokens = opts.maxTokens
+      const header = { config }
+      if (opts.adapterDefaults !== undefined) header.adapterDefaults = opts.adapterDefaults
+      return header
     },
     setLastAssistant(blocks) { lastAssistant = { role: 'assistant', content: blocks } },
     deriveMessages() {
@@ -111,7 +116,7 @@ test('v1.4.0 机制：inbox 决策并追加 request/header 真实切换（shadow
   const appends = headers()
   assert.equal(appends.length, 1, 'active 模式应追加一次 request/header')
   assert.equal(appends[0].data.header.config.model, 'deepseek-flash', '简单任务应切 flash')
-  assert.equal(appends[0].data.reason, 'router')
+  assert.equal(appends[0].data.reason, 'change', 'DSH 只接受 initial/resume/change/series 四种 reason')
 
   // agent/request 必须只读透传（不再替换配置）
   const cfg = await req(payload('s1', 2, session), async () => ({ provider: 'deepseek-official', model: 'deepseek-v4-pro' }))
@@ -155,7 +160,7 @@ test('冷启动：读上次探测的本地缓存（models.json）即可立即决
   const appends = session.events.filter((e) => e.type === 'request/header')
   assert.equal(appends.length, 1, '有本地缓存时冷启动也应立即切换')
   assert.equal(appends[0].data.header.config.model, 'deepseek-flash', '缓存档位应把简单问答切到 flash')
-  assert.equal(appends[0].data.reason, 'router')
+  assert.equal(appends[0].data.reason, 'change', 'DSH 只接受 initial/resume/change/series 四种 reason')
 })
 
 test('新装无缓存：探测未就绪时不切换也不报错——绝不使用写死的模型清单（v1.6.1）', async () => {
@@ -233,7 +238,7 @@ test('v1.5.0 步骤级路由：重型工具调用 → 下一步升级 pro；轻�
   const h1 = headers()
   assert.equal(h1.length, 1, 'llm/stream 收尾应追加 header')
   assert.equal(h1[0].data.header.config.model, 'deepseek-v4-pro', '应升级到 pro')
-  assert.equal(h1[0].data.reason, 'router-step', '步骤级切换 reason 应为 router-step')
+  assert.equal(h1[0].data.reason, 'change', '步骤级切换同样只能写 change（DSH 拒绝 router-step）')
 
   // 上一步转轻量工具（read）→ 挂起降回基线 flash
   session.setLastAssistant([{ type: 'tool-call', id: 'c2', name: 'read', arguments: '{}' }])
@@ -666,4 +671,28 @@ test('模型目录：TTL 到期后 request 路径自动重探（惰性刷新）'
   await ctx.listeners['agent/request'](payload('s1', 1), async () => ({ provider: 'deepseek-official', model: 'deepseek-v4-pro' }))
   await tick()
   assert.ok(calls > startupCalls, 'TTL 过期触发后台重探，不阻塞 request')
+})
+
+test('切档时同步清理 adapterDefaults：不留下无 config 支撑的 marker（防会话被判 corrupt）', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-router-adapter-defaults-'))
+  const ctx = mockCtx()
+  apply(ctx, { home })
+  await tick()
+  const setMode = ctx.registered.find((t) => t.name === 'agentic_router_set_mode')
+  await setMode.execute({ mode: 'active' }, {})
+  const session = mockSession('ad-1', 'deepseek-v4-pro', {
+    reasoningEffort: 'high',
+    maxTokens: 256000,
+    adapterDefaults: { reasoningEffort: true, maxTokens: true },
+  })
+  const P = (t, text) => ({ agent: { sessionId: 'ad-1', session }, turn: t, step: 1, signal: {}, message: { role: 'user', content: [{ type: 'text', text }] } })
+  await ctx.listeners['agent/inbox/claimed'](P(1, QA_TASK))
+  const appends = session.events.filter((e) => e.type === 'request/header')
+  assert.equal(appends.length, 1, 'active 模式应追加 header')
+  const header = appends[0].data.header
+  assert.equal(header.config.model, 'deepseek-flash', '简单任务应切 flash')
+  assert.equal(header.config.reasoningEffort, undefined, 'fast/mid 档应删掉 config.reasoningEffort')
+  assert.ok(!header.adapterDefaults || header.adapterDefaults.reasoningEffort === undefined,
+    'adapterDefaults.reasoningEffort 不能在没有 config.reasoningEffort 时保留')
+  assert.equal(header.adapterDefaults && header.adapterDefaults.maxTokens, true, 'config 里仍有 maxTokens 时保留其 marker')
 })

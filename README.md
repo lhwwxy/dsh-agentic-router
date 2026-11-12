@@ -32,6 +32,8 @@ provider 后再决策应用；`agentic_router_force` 钉死模型、步骤级路
 （默认 10 分钟）、请求出错（自愈已下线模型）、`agentic_router_refresh_models` 手动刷新。
 `agentic_router_stats` 的 `modelCatalog` 透明标注目录来源（live/cache/empty）与探测时间。
 
+**v1.6.2 会话重启 corrupt 修复**：`request/header` 的 `reason` 收敛为 DSH 唯一合法的 `change`（不再写 `router`/`router-step`，否则重启载入会话报 `invalid reason`）；切到 fast/mid 档删掉 `config.reasoningEffort` 时，同步清理 `header.adapterDefaults` 里无 config 支撑的 marker（否则载入报 `invalid adapterDefaults`），避免会话被判 corrupt、侧边栏历史丢失。
+
 ## 架构
 
 ```

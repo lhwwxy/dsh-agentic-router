@@ -195,7 +195,7 @@ function currentProvider(session) {
 // 核心切换：向会话日志追加 request/header（reason: 'router' / 'router-step'），
 // 下一轮 prompt 组装即读到新模型。fast/mid 档去掉 reasoningEffort，
 // 让目标模型走自身默认 effort（避免 flash 不支持 max 而整步失败）。
-function appendRouterHeader(session, targetModel, reason = 'router', targetProvider = null) {
+function appendRouterHeader(session, targetModel, reason = 'change', targetProvider = null) {
   try {
     const last = session.requestHeader()
     const header = {}
@@ -209,6 +209,17 @@ function appendRouterHeader(session, targetModel, reason = 'router', targetProvi
     if (targetProvider && config.provider !== targetProvider) config.provider = targetProvider
     if (tierOf(targetModel) !== 'strong') delete config.reasoningEffort
     header.config = config
+    // DSH 载入校验：adapterDefaults 的 marker 必须对应 config 里真实存在的字段，
+    // 否则重启后整条会话被判 corrupt（invalid adapterDefaults）。切档删掉
+    // reasoningEffort 后必须同步删掉对应 marker；maxTokens 同理。
+    if (header.adapterDefaults && typeof header.adapterDefaults === 'object') {
+      const defaults = {}
+      for (const k of ['reasoningEffort', 'maxTokens']) {
+        if (header.adapterDefaults[k] === true && config[k] !== undefined) defaults[k] = true
+      }
+      if (Object.keys(defaults).length > 0) header.adapterDefaults = defaults
+      else delete header.adapterDefaults
+    }
     session.append('request/header', { header, reason })
     return true
   } catch (e) {
@@ -485,7 +496,7 @@ export function apply(ctx, config = {}) {
     if (state.mode !== 'active' || !target) return false
     const base = td.actualModel || td.currentModel
     if (base && target === base) return false
-    const ok = session ? appendRouterHeader(session, target, 'router', td.targetProvider || null) : false
+    const ok = session ? appendRouterHeader(session, target, 'change', td.targetProvider || null) : false
     td.applied = ok
     if (record) { record.applied = ok; record.swapped = ok }
     if (ok) {
@@ -662,7 +673,7 @@ export function apply(ctx, config = {}) {
             } catch (e) { session = null }
             if (session) {
               if (td.stepTarget && !state.forced && (td.stepTarget !== currentModel(session) || (td.stepTargetProvider && td.stepTargetProvider !== currentProvider(session)))) {
-                const ok = appendRouterHeader(session, td.stepTarget, 'router-step', td.stepTargetProvider || null)
+                const ok = appendRouterHeader(session, td.stepTarget, 'change', td.stepTargetProvider || null)
                 if (ok) {
                   state.counters.stepSwitches++
                   if (td.stepRec) { td.stepRec.applied = true }
@@ -869,7 +880,7 @@ export function apply(ctx, config = {}) {
                 try {
                   const session = sessionOf({ agent })
                   if (session && currentModel(session) !== pf.model) {
-                    const ok = appendRouterHeader(session, pf.model, 'router', pf.provider)
+                    const ok = appendRouterHeader(session, pf.model, 'change', pf.provider)
                     if (ok) state.headerAppends++
                   }
                 } catch (e) { /* per-agent best effort */ }
