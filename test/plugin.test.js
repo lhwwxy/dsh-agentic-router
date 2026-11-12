@@ -19,6 +19,7 @@ function mockSession(id, startModel = 'deepseek-v4-pro', opts = {}) {
   return {
     id,
     events,
+    snapshotEvents() { return events },
     append(type, data) {
       events.push({ type, data })
       if (type === 'request/header' && data && data.header && data.header.config) {
@@ -519,6 +520,7 @@ test('v1.6.0 force：钉死模型，步骤级路由不再覆盖', async () => {
   inbox(P(1, QA_TASK)) // 基线 flash，已是 flash → 不追加
   assert.equal(headers().length, 0)
 
+  session.events.push({ type: 'turn/start', data: {} }) // 进行中：打开 turn
   await forceTool.execute({ model: 'deepseek-v4-pro' }, {}) // force 立即追加 header
   assert.equal(headers().length, 1)
   assert.equal(headers()[0].data.header.config.model, 'deepseek-v4-pro')
@@ -527,6 +529,19 @@ test('v1.6.0 force：钉死模型，步骤级路由不再覆盖', async () => {
   preStep(PRE(1, 2), async () => ({})) // 重型工具，本应升级；force 下跳过
   await drain('s1')
   assert.equal(headers().length, 1, 'force 下步骤级路由不得覆盖')
+})
+
+test('v1.6.3 force：空闲会话（无进行中 turn）不追加 header', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-router-force-idle-'))
+  const session = mockSession('s1', 'deepseek-flash')
+  const sessions = new Map([['s1', session]])
+  const agents = { list() { return [{ session }] } }
+  const ctx = mockCtx({ sessions, agents })
+  apply(ctx, { home, mode: 'active' })
+  await tick()
+  const forceTool = ctx.registered.find((t) => t.name === 'agentic_router_force')
+  await forceTool.execute({ model: 'deepseek-v4-pro' }, {})
+  assert.equal(session.events.filter((e) => e.type === 'request/header').length, 0, '空闲会话不得被 force 追加 header')
 })
 
 test('v1.6.0 首回合延迟决策：inbox 无 header → 首个 request 拿到 provider 后解析并应用', async () => {
