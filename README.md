@@ -20,6 +20,12 @@ DeepSeek Harness（DSH）插件：**学习型智能路由（agentic router）+ �
 （步骤切换对下一步生效，一阶延迟）。步骤级决策落盘 `steps.jsonl`，`agentic_router_stats`
 可见 `stepSwitches` 与 `stepLog`。
 
+**v1.6.0 跨 provider 与修复**：`resolveTier` 支持跨 provider 解析——优先当前 provider 同档候选，
+无候选时按 providers 顺序取其它 provider 同档模型（mid 档再回退 strong/fast），`request/header`
+同时写入目标 `provider` 与 `model`；每个会话首回合（尚无 header/provider）延迟到首个请求拿到真实
+provider 后再决策应用；`agentic_router_force` 钉死模型、步骤级路由不再覆盖；内置价表补齐
+`deepseek-account`，并在加载时与旧 `policy.json` 价格合并。可用配置 `crossProvider: false` 关闭跨 provider。
+
 ## 架构
 
 ```

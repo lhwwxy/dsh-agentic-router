@@ -21,18 +21,45 @@ export function tierTarget(tier, provider, modelTiers) {
   return null
 }
 
-// 档位 → 模型 id 的解析；mid 档无候选时向上取 strong（保质量），再取 fast
-export function resolveTier(tier, provider, modelTiers) {
-  if (!modelTiers) return { target: null, used: tier, note: 'tiers-not-ready' }
-  const target = tierTarget(tier, provider, modelTiers)
-  if (target) return { target, used: tier, note: '' }
-  if (tier === 'mid') {
-    const strong = tierTarget('strong', provider, modelTiers)
-    if (strong) return { target: strong, used: 'strong', note: 'mid->strong fallback' }
-    const fast = tierTarget('fast', provider, modelTiers)
-    if (fast) return { target: fast, used: 'fast', note: 'mid->fast fallback' }
+// 档位是否有候选（跨所有 provider）——供 availableTiersFor 判断该档是否值得探索
+export function tierHasAny(tier, modelTiers) {
+  const list = modelTiers && modelTiers.tiers && modelTiers.tiers[tier]
+  return Array.isArray(list) && list.length > 0
+}
+
+// 档位 → 模型 id 的解析（v1.6.0 支持跨 provider）：
+//   1) 优先当前 provider 的候选（保持会话 provider 稳定，避免无谓跨厂商）
+//   2) 无候选时，若 crossProvider（默认开），按 providers 顺序取其它 provider 的同档候选
+//   3) mid 档仍无候选时：先同 provider 的 strong/fast，再跨 provider 的 strong/fast
+// 返回 { target, provider, used, note }；provider 为最终选定的 provider id。
+export function resolveTier(tier, provider, modelTiers, opts = {}) {
+  if (!modelTiers) return { target: null, provider: null, used: tier, note: 'tiers-not-ready' }
+  const cross = opts.crossProvider !== false
+  const same = (t) => {
+    const m = tierTarget(t, provider, modelTiers)
+    return m ? { provider, model: m } : null
   }
-  return { target: null, used: tier, note: 'no-candidate' }
+  const crossPick = (t) => {
+    if (!cross) return null
+    for (const p of modelTiers.providers || []) {
+      const pid = p && (p.provider || p.id || p.name)
+      if (!pid || pid === provider) continue
+      const m = tierTarget(t, pid, modelTiers)
+      if (m) return { provider: pid, model: m }
+    }
+    return null
+  }
+  const isCross = (r) => !!(r && provider && r.provider !== provider)
+
+  const direct = same(tier) || crossPick(tier)
+  if (direct) return { target: direct.model, provider: direct.provider, used: tier, note: isCross(direct) ? 'cross-provider' : '' }
+  if (tier === 'mid') {
+    const strong = same('strong') || crossPick('strong')
+    if (strong) return { target: strong.model, provider: strong.provider, used: 'strong', note: 'mid->strong fallback' + (isCross(strong) ? ' [cross-provider]' : '') }
+    const fast = same('fast') || crossPick('fast')
+    if (fast) return { target: fast.model, provider: fast.provider, used: 'fast', note: 'mid->fast fallback' + (isCross(fast) ? ' [cross-provider]' : '') }
+  }
+  return { target: null, provider: null, used: tier, note: 'no-candidate' }
 }
 
 export function recommendRule(cls) {
@@ -117,6 +144,12 @@ export function recommendKnn(cls, f, knnState, availableTiers = ['fast', 'mid', 
 //   4) CONSERVATIVE                     保守值 + 标记 unknown，提醒用户补价格
 export const DEFAULT_PRICES = {
   'deepseek-official': {
+    'deepseek-flash': { in: 0.2, out: 2 },
+    'deepseek-v4-flash': { in: 0.2, out: 2 },
+    'deepseek-v4-pro': { in: 1, out: 12 },
+  },
+  'deepseek-account': {
+    'deepseek-flash': { in: 0.2, out: 2 },
     'deepseek-v4-flash': { in: 0.2, out: 2 },
     'deepseek-v4-pro': { in: 1, out: 12 },
   },
@@ -125,6 +158,25 @@ export const DEFAULT_PRICES = {
     mid: { in: 2, out: 8 },
     strong: { in: 3, out: 16 },
   },
+}
+
+// 价格表合并：以 base（内置默认价）为底，over（policy/config 的用户覆盖）为准。
+// 这样新增内置价（如 deepseek-account）能对既有安装生效，同时不覆盖用户自定义价格。
+export function mergePrices(base, over) {
+  const out = {}
+  for (const [k, v] of Object.entries(base || {})) {
+    out[k] = {}
+    for (const [k2, v2] of Object.entries(v || {})) out[k][k2] = { ...v2 }
+  }
+  for (const [k, v] of Object.entries(over || {})) {
+    if (!out[k]) out[k] = {}
+    for (const [k2, v2] of Object.entries(v || {})) {
+      if (v2 && typeof v2 === 'object' && typeof v2.in === 'number' && typeof v2.out === 'number') {
+        out[k][k2] = { in: v2.in, out: v2.out }
+      }
+    }
+  }
+  return out
 }
 
 const CONSERVATIVE = { in: 3, out: 16 }

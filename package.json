@@ -1,6 +1,6 @@
 {
   "name": "dsh-agentic-router",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "description": "DeepSeek Harness plugin: learning agentic router — rule + UCB + LinUCB + k-NN experts under an EXP3 meta-selector, with a durable quality-reward flywheel, REAL model switching via the session request-header precedence chain, and STEP-LEVEL routing (v1.5.0)",
   "type": "module",
   "license": "MIT",

@@ -10,8 +10,10 @@ import { Store } from '../dsh/store.js'
 
 // 会话 mock：requestHeader 反映最近追加的 header（模拟真实 fold 行为）；
 // deriveMessages 返回可注入的最后一条 assistant 消息（供步骤级路由 v1.5.0 读取工具调用）
-function mockSession(id, startModel = 'deepseek-v4-pro') {
+function mockSession(id, startModel = 'deepseek-v4-pro', opts = {}) {
   let model = startModel
+  let provider = opts.provider || 'deepseek-official'
+  let hasHeader = opts.noHeader ? false : true
   const events = []
   let lastAssistant = null
   return {
@@ -19,12 +21,15 @@ function mockSession(id, startModel = 'deepseek-v4-pro') {
     events,
     append(type, data) {
       events.push({ type, data })
-      if (type === 'request/header' && data && data.header && data.header.config && typeof data.header.config.model === 'string') {
-        model = data.header.config.model
+      if (type === 'request/header' && data && data.header && data.header.config) {
+        if (typeof data.header.config.model === 'string') model = data.header.config.model
+        if (typeof data.header.config.provider === 'string') provider = data.header.config.provider
+        hasHeader = true
       }
     },
     requestHeader() {
-      return { config: { provider: 'deepseek-official', model }, adapterDefaults: {} }
+      if (!hasHeader) return null
+      return { config: { provider, model }, adapterDefaults: {} }
     },
     setLastAssistant(blocks) { lastAssistant = { role: 'assistant', content: blocks } },
     deriveMessages() {
@@ -37,6 +42,7 @@ function mockSession(id, startModel = 'deepseek-v4-pro') {
 function mockCtx(opts = {}) {
   const listeners = {}
   const registered = []
+  const providers = opts.providers || [{ id: 'deepseek-official', models: ['deepseek-flash', 'deepseek-v4-pro'] }]
   return {
     listeners,
     registered,
@@ -46,10 +52,11 @@ function mockCtx(opts = {}) {
       }
       if (k === 'llm') {
         return {
-          async listProviders() { return [{ id: 'deepseek-official' }] },
-          async listModels() {
+          async listProviders() { return providers },
+          async listModels(pid) {
             if (opts.slowModels) return new Promise(() => {}) // 永不 resolve：模拟档位表加载未完成
-            return [{ id: 'deepseek-v4-flash' }, { id: 'deepseek-v4-pro' }]
+            const p = providers.find((x) => (x.id || x.name || x.provider) === pid)
+            return (p ? p.models : []).map((id) => ({ id }))
           },
         }
       }
@@ -101,7 +108,7 @@ test('v1.4.0 机制：inbox 决策并追加 request/header 真实切换（shadow
   await inbox(P(2, QA_TASK))
   const appends = headers()
   assert.equal(appends.length, 1, 'active 模式应追加一次 request/header')
-  assert.equal(appends[0].data.header.config.model, 'deepseek-v4-flash', '简单任务应切 flash')
+  assert.equal(appends[0].data.header.config.model, 'deepseek-flash', '简单任务应切 flash')
   assert.equal(appends[0].data.reason, 'router')
 
   // agent/request 必须只读透传（不再替换配置）
@@ -119,7 +126,7 @@ test('v1.4.0 机制：inbox 决策并追加 request/header 真实切换（shadow
 
   const decisions = store.loadJsonl('decisions.jsonl')
   assert.equal(decisions.length, 2)
-  assert.equal(decisions[1].targetModel, 'deepseek-v4-flash')
+  assert.equal(decisions[1].targetModel, 'deepseek-flash')
   assert.equal(decisions[1].applied, true, 'header 追加成功应标记 applied')
   assert.equal(decisions[1].swapped, true, '真实切换应标记 swapped')
 
@@ -144,7 +151,7 @@ test('冷启动：档位表异步加载未完成时，inbox 仍用兜底档位�
   inbox(P(1, QA_TASK))
   const appends = session.events.filter((e) => e.type === 'request/header')
   assert.equal(appends.length, 1, '冷启动下也应立即追加 header')
-  assert.equal(appends[0].data.header.config.model, 'deepseek-v4-flash', '兜底档位表应把简单问答切到 flash')
+  assert.equal(appends[0].data.header.config.model, 'deepseek-flash', '兜底档位表应把简单问答切到 flash')
   assert.equal(appends[0].data.reason, 'router')
 })
 
@@ -170,7 +177,7 @@ test('v1.4.2：UCB 不探索无候选的 mid 档——简单任务决策里 recs
 
 test('v1.5.0 步骤级路由：重型工具调用 → 下一步升级 pro；轻量工具 → 回到回合基线 flash', async () => {
   const home = mkdtempSync(join(tmpdir(), 'dsh-router-step-'))
-  const session = mockSession('s1', 'deepseek-v4-flash') // 当前 flash
+  const session = mockSession('s1', 'deepseek-flash') // 当前 flash
   const sessions = new Map([['s1', session]])
   const ctx = mockCtx({ sessions })
   apply(ctx, { home, mode: 'active' })
@@ -213,7 +220,7 @@ test('v1.5.0 步骤级路由：重型工具调用 → 下一步升级 pro；轻�
   await drain('s1')
   const h2 = headers()
   assert.equal(h2.length, 2, '轻量工具后应追加 header 降回 flash')
-  assert.equal(h2[1].data.header.config.model, 'deepseek-v4-flash', '应降回 flash')
+  assert.equal(h2[1].data.header.config.model, 'deepseek-flash', '应降回 flash')
 
   // stats 可见步骤级记录
   const stats = await ctx.registered.find((t) => t.name === 'agentic_router_stats').execute({}, {})
@@ -244,7 +251,7 @@ test('兜底路径：request 决策 + llm/stream 延迟应用（中途热加载�
 
   const appends = session.events.filter((e) => e.type === 'request/header')
   assert.equal(appends.length, 1, 'llm/stream 后应补应用一次 header')
-  assert.equal(appends[0].data.header.config.model, 'deepseek-v4-flash')
+  assert.equal(appends[0].data.header.config.model, 'deepseek-flash')
 })
 
 test('飞轮重放：新实例从 rewards.jsonl 恢复学习状态', async () => {
@@ -462,4 +469,111 @@ test('未知 provider 不套用 DeepSeek 价格：用通用档位并标记来源
   // '*' fast = (1000×1 + 1000×4)/1e6 = 0.005
   assert.ok(Math.abs(rewards[0].breakdown.costYuan - 0.005) < 1e-9)
   assert.equal(rewards[0].breakdown.pricingSource, 'generic-tier')
+})
+
+test('v1.6.0 force：钉死模型，步骤级路由不再覆盖', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-router-force-'))
+  const session = mockSession('s1', 'deepseek-flash')
+  const sessions = new Map([['s1', session]])
+  const agents = { list() { return [{ session }] } }
+  const ctx = mockCtx({ sessions, agents })
+  apply(ctx, { home, mode: 'active' })
+  const inbox = ctx.listeners['agent/inbox/claimed']
+  const preStep = ctx.listeners['agent/pre-step']
+  const stream = ctx.listeners['llm/stream']
+  const forceTool = ctx.registered.find((t) => t.name === 'agentic_router_force')
+
+  const P = (t, text) => ({ agent: { sessionId: 's1', session }, turn: t, step: 1, signal: {}, message: { role: 'user', content: [{ type: 'text', text }] } })
+  const PRE = (t, s) => ({ agent: { sessionId: 's1', session }, turn: t, step: s, signal: {}, messages: [] })
+  const drain = async (sid) => { const w = stream({ sessionId: sid, provider: 'deepseek-official' }, async function* () { yield { type: 'finish', reason: 'stop' } }); for await (const c of w) {} }
+  const headers = () => session.events.filter((e) => e.type === 'request/header')
+
+  inbox(P(1, QA_TASK)) // 基线 flash，已是 flash → 不追加
+  assert.equal(headers().length, 0)
+
+  await forceTool.execute({ model: 'deepseek-v4-pro' }, {}) // force 立即追加 header
+  assert.equal(headers().length, 1)
+  assert.equal(headers()[0].data.header.config.model, 'deepseek-v4-pro')
+
+  session.setLastAssistant([{ type: 'tool-call', id: 'c1', name: 'bash', arguments: '{}' }])
+  preStep(PRE(1, 2), async () => ({})) // 重型工具，本应升级；force 下跳过
+  await drain('s1')
+  assert.equal(headers().length, 1, 'force 下步骤级路由不得覆盖')
+})
+
+test('v1.6.0 首回合延迟决策：inbox 无 header → 首个 request 拿到 provider 后解析并应用', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-router-firstturn-'))
+  const session = mockSession('s1', 'deepseek-v4-pro', { noHeader: true })
+  const sessions = new Map([['s1', session]])
+  const ctx = mockCtx({ sessions })
+  apply(ctx, { home, mode: 'active' })
+  const inbox = ctx.listeners['agent/inbox/claimed']
+  const req = ctx.listeners['agent/request']
+  const stream = ctx.listeners['llm/stream']
+  const P = (t, text) => ({ agent: { sessionId: 's1', session }, turn: t, step: 1, signal: {}, message: { role: 'user', content: [{ type: 'text', text }] } })
+
+  inbox(P(1, QA_TASK))
+  assert.equal(session.events.filter((e) => e.type === 'request/header').length, 0)
+  assert.equal(new Store(home).loadJsonl('decisions.jsonl').length, 0, '首回合无 provider 前不落盘')
+
+  const cfg = await req(payload('s1', 1, session), async () => ({ provider: 'deepseek-official', model: 'deepseek-v4-pro' }))
+  assert.equal(cfg.model, 'deepseek-v4-pro', 'request 透传')
+  const decisions = new Store(home).loadJsonl('decisions.jsonl')
+  assert.equal(decisions.length, 1, 'request 后应落盘一条决策')
+  assert.equal(decisions[0].targetModel, 'deepseek-flash')
+  assert.equal(decisions[0].resolvedTier, 'fast')
+
+  const wrapped = stream({ sessionId: 's1', provider: 'deepseek-official' }, async function* () { yield { type: 'finish', reason: 'stop' } })
+  for await (const c of wrapped) {}
+  const appends = session.events.filter((e) => e.type === 'request/header')
+  assert.equal(appends.length, 1)
+  assert.equal(appends[0].data.header.config.model, 'deepseek-flash')
+})
+
+test('v1.6.0 跨 provider：当前 provider 无目标档候选时切到其它 provider', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-router-cross-'))
+  const session = mockSession('s1', 'alpha-pro', { provider: 'alpha' })
+  const sessions = new Map([['s1', session]])
+  const providers = [
+    { id: 'alpha', models: ['alpha-pro'] },
+    { id: 'beta', models: ['beta-flash'] },
+  ]
+  const ctx = mockCtx({ sessions, providers })
+  apply(ctx, { home, mode: 'active' })
+  await new Promise((r) => setTimeout(r, 0)) // 等权威档位表加载
+  const inbox = ctx.listeners['agent/inbox/claimed']
+  const P = (t, text) => ({ agent: { sessionId: 's1', session }, turn: t, step: 1, signal: {}, message: { role: 'user', content: [{ type: 'text', text }] } })
+  inbox(P(1, QA_TASK))
+  const appends = session.events.filter((e) => e.type === 'request/header')
+  assert.equal(appends.length, 1)
+  assert.equal(appends[0].data.header.config.model, 'beta-flash')
+  assert.equal(appends[0].data.header.config.provider, 'beta', '应切换 provider')
+})
+
+test('v1.6.0 crossProvider=false：无同 provider 候选时不跨、不切换', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-router-nocross-'))
+  const session = mockSession('s1', 'alpha-pro', { provider: 'alpha' })
+  const sessions = new Map([['s1', session]])
+  const providers = [
+    { id: 'alpha', models: ['alpha-pro'] },
+    { id: 'beta', models: ['beta-flash'] },
+  ]
+  const ctx = mockCtx({ sessions, providers })
+  apply(ctx, { home, mode: 'active', crossProvider: false })
+  await new Promise((r) => setTimeout(r, 0))
+  const inbox = ctx.listeners['agent/inbox/claimed']
+  const P = (t, text) => ({ agent: { sessionId: 's1', session }, turn: t, step: 1, signal: {}, message: { role: 'user', content: [{ type: 'text', text }] } })
+  inbox(P(1, QA_TASK))
+  assert.equal(session.events.filter((e) => e.type === 'request/header').length, 0, 'crossProvider=false 不得跨 provider')
+})
+
+test('v1.6.0 价格合并：内置 deepseek-account 价对旧 policy 生效', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-router-pricemerge-'))
+  new Store(home).savePolicy({ mode: 'active', forced: null, prices: { 'deepseek-official': { 'deepseek-v4-flash': { in: 0.2, out: 2 } }, '*': { fast: { in: 1, out: 4 }, mid: { in: 2, out: 8 }, strong: { in: 3, out: 16 } } } })
+  const ctx = mockCtx({})
+  apply(ctx, { home })
+  const stats = await ctx.registered.find((t) => t.name === 'agentic_router_stats').execute({}, {})
+  assert.ok(stats.prices['deepseek-account'], '应合并出 deepseek-account 内置价')
+  assert.equal(stats.prices['deepseek-account']['deepseek-flash'].in, 0.2)
+  assert.equal(stats.prices['deepseek-official']['deepseek-v4-flash'].in, 0.2, '旧 policy 覆盖保留')
 })

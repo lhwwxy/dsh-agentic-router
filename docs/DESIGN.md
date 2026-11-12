@@ -263,3 +263,9 @@ loop 每步顺序：`inbox.claim()`（发 `agent/inbox/claimed`）→ `systemPro
 - 奖励飞轮仍按回合结算（回合基线的策略选择），步骤级是确定性规则；未来可把步骤级升降档纳入学习（如按工具调用频率学阈值）
 - 重型集合 `HEAVY_TOOLS` 是静态清单，可配置化
 - 降级方向：重型步骤后的轻量步骤会回到基线（简单任务场景：写代码阶段 pro、前后问答 flash）
+
+### 13.6 v1.6.0：跨 provider 解析、首回合延迟与 force 钉死
+
+- `resolveTier` 解析顺序：同 provider 同档 → 其它 provider 同档（`crossProvider`，默认开）→ mid 回退（同 provider strong/fast → 跨 provider strong/fast）；`appendRouterHeader` 同步写 `config.provider` 与 `config.model`
+- 首回合（`currentProvider` 为空）在 inbox 只挂起，等首个 `agent/request` 拿到真实 provider 后解析并落盘，再于 `llm/stream` 延迟应用
+- `agentic_router_force` 期间跳过步骤级升降档（force 钉死模型）；force 支持 `model` 或 `provider/model`

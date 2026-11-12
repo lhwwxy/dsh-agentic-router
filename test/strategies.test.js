@@ -2,10 +2,10 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
-  tierOf, tierTarget, resolveTier,
+  tierOf, tierTarget, tierHasAny, resolveTier,
   recommendRule, recommendUcb, recommendLin, recommendKnn,
   rewardOf, applyReward, correctReward,
-  DEFAULT_PRICES, turnCostYuan, resolvePrice,
+  DEFAULT_PRICES, turnCostYuan, resolvePrice, mergePrices,
 } from '../dsh/strategies.js'
 import { metaPick, DEFAULT_WEIGHTS } from '../dsh/meta.js'
 
@@ -73,9 +73,55 @@ test('v1.4.2：availableTiers 过滤后 UCB/LinUCB 只推荐可用档位（不�
 
 test('resolveTier：mid 档无候选时向上取 strong（实测修复）', () => {
   assert.deepEqual(resolveTier('mid', 'deepseek-official', MODEL_TIERS),
-    { target: 'deepseek-v4-pro', used: 'strong', note: 'mid->strong fallback' })
+    { target: 'deepseek-v4-pro', provider: 'deepseek-official', used: 'strong', note: 'mid->strong fallback' })
   assert.equal(resolveTier('fast', 'deepseek-official', MODEL_TIERS).target, 'deepseek-v4-flash')
   assert.equal(resolveTier('strong', 'deepseek-official', MODEL_TIERS).target, 'deepseek-v4-pro')
+  assert.equal(resolveTier('fast', 'deepseek-official', MODEL_TIERS).provider, 'deepseek-official')
+})
+
+test('v1.6.0 跨 provider：同 provider 无候选时取其它 provider 同档，并返回 provider', () => {
+  const tiers = {
+    providers: [
+      { provider: 'alpha', models: ['alpha-pro'] },
+      { provider: 'beta', models: ['beta-flash'] },
+    ],
+    tiers: { fast: ['beta/beta-flash'], mid: [], strong: ['alpha/alpha-pro'] },
+  }
+  assert.deepEqual(resolveTier('fast', 'alpha', tiers),
+    { target: 'beta-flash', provider: 'beta', used: 'fast', note: 'cross-provider' })
+  assert.deepEqual(resolveTier('strong', 'beta', tiers),
+    { target: 'alpha-pro', provider: 'alpha', used: 'strong', note: 'cross-provider' })
+  assert.deepEqual(resolveTier('strong', 'alpha', tiers),
+    { target: 'alpha-pro', provider: 'alpha', used: 'strong', note: '' })
+})
+
+test('v1.6.0 crossProvider=false：不跨 provider，无候选即 no-candidate', () => {
+  const tiers = {
+    providers: [
+      { provider: 'alpha', models: ['alpha-pro'] },
+      { provider: 'beta', models: ['beta-flash'] },
+    ],
+    tiers: { fast: ['beta/beta-flash'], mid: [], strong: ['alpha/alpha-pro'] },
+  }
+  assert.deepEqual(resolveTier('fast', 'alpha', tiers, { crossProvider: false }),
+    { target: null, provider: null, used: 'fast', note: 'no-candidate' })
+})
+
+test('mergePrices：内置默认价为底，用户覆盖为准，新增内置价对旧安装生效', () => {
+  const over = { 'deepseek-official': { 'deepseek-v4-flash': { in: 9, out: 9 } }, openai: { 'gpt-x': { in: 5, out: 50 } } }
+  const merged = mergePrices(DEFAULT_PRICES, over)
+  assert.equal(merged['deepseek-account']['deepseek-flash'].in, 0.2, '新增 deepseek-account 内置价应生效')
+  assert.equal(merged['deepseek-official']['deepseek-v4-flash'].in, 9, '用户覆盖优先')
+  assert.equal(merged['deepseek-official']['deepseek-flash'].in, 0.2, '未被覆盖的内置价保留')
+  assert.equal(merged.openai['gpt-x'].out, 50, '用户新增 provider 保留')
+  assert.equal(merged['*'].fast.in, 1, '通用档位保留')
+})
+
+test('tierHasAny：档位是否有候选（跨 provider 判断）', () => {
+  const tiers = { providers: [], tiers: { fast: ['a/f1'], mid: [], strong: [] } }
+  assert.equal(tierHasAny('fast', tiers), true)
+  assert.equal(tierHasAny('mid', tiers), false)
+  assert.equal(tierHasAny('strong', tiers), false)
 })
 
 test('规则表阈值：低→fast，中→mid，高→strong', () => {

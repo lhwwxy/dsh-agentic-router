@@ -22,10 +22,10 @@
 
 import { classify, featuresOf } from './classify.js'
 import {
-  tierOf, tierTarget, resolveTier,
+  tierOf, tierTarget, tierHasAny, resolveTier,
   recommendRule, recommendUcb, recommendLin, recommendKnn,
   rewardOf, applyReward, correctReward,
-  DEFAULT_PRICES, turnCostYuan, resolvePrice,
+  DEFAULT_PRICES, turnCostYuan, resolvePrice, mergePrices,
 } from './strategies.js'
 import { metaPick, DEFAULT_WEIGHTS } from './meta.js'
 import { Store, defaultHome } from './store.js'
@@ -56,10 +56,15 @@ function fallbackTiers() {
 
 // 当前 provider 有候选模型的档位列表（UCB/LinUCB/k-NN 只在这些档位间探索）。
 // provider 缺失或档位表不可用时回退到全部档位（保持专家函数原有行为）。
-function availableTiersFor(provider, modelTiers) {
+function availableTiersFor(provider, modelTiers, crossProvider) {
   const all = ['fast', 'mid', 'strong']
-  if (!modelTiers || !provider) return all
-  const has = all.filter((t) => tierTarget(t, provider, modelTiers))
+  if (!modelTiers) return all
+  if (provider && !crossProvider) {
+    const has = all.filter((t) => tierTarget(t, provider, modelTiers))
+    return has.length ? has : all
+  }
+  // 跨 provider（或无 provider）：只看档位是否有候选（跨所有 provider），避免探索"幽灵档"
+  const has = all.filter((t) => tierHasAny(t, modelTiers))
   return has.length ? has : all
 }
 
@@ -69,6 +74,7 @@ function freshState() {
     seq: 0,
     decisions: [],
     forced: null,
+    crossProvider: true,
     pending: new Map(),
     modelTiers: fallbackTiers(),
     turnDecision: {},
@@ -193,7 +199,7 @@ function currentProvider(session) {
 // 核心切换：向会话日志追加 request/header（reason: 'router' / 'router-step'），
 // 下一轮 prompt 组装即读到新模型。fast/mid 档去掉 reasoningEffort，
 // 让目标模型走自身默认 effort（避免 flash 不支持 max 而整步失败）。
-function appendRouterHeader(session, targetModel, reason = 'router') {
+function appendRouterHeader(session, targetModel, reason = 'router', targetProvider = null) {
   try {
     const last = session.requestHeader()
     const header = {}
@@ -204,6 +210,7 @@ function appendRouterHeader(session, targetModel, reason = 'router') {
     const config = {}
     for (const k of Object.keys(prevConfig)) config[k] = prevConfig[k]
     config.model = targetModel
+    if (targetProvider && config.provider !== targetProvider) config.provider = targetProvider
     if (tierOf(targetModel) !== 'strong') delete config.reasoningEffort
     header.config = config
     session.append('request/header', { header, reason })
@@ -211,6 +218,14 @@ function appendRouterHeader(session, targetModel, reason = 'router') {
   } catch (e) {
     return false
   }
+}
+
+// 解析强制模型：支持 'model' 或 'provider/model'（跨厂商强制时需指定 provider）
+function parseForced(forced) {
+  if (typeof forced !== 'string' || !forced) return { provider: null, model: forced || null }
+  const i = forced.indexOf('/')
+  if (i > 0) return { provider: forced.slice(0, i), model: forced.slice(i + 1) }
+  return { provider: null, model: forced }
 }
 
 // 步骤级路由（v1.5.0）：视为"重型工作"的工具调用——上一步出现它们时，
@@ -264,12 +279,15 @@ export function apply(ctx, config = {}) {
   const store = new Store(config.home || defaultHome())
   const settleDelayMs = typeof config.settleDelayMs === 'number' ? config.settleDelayMs : SETTLE_DELAY_MS
   const policy = store.loadPolicy()
-  let prices = (policy.prices && Object.keys(policy.prices).length) ? policy.prices : (config.prices || DEFAULT_PRICES)
+  const overlay = (policy.prices && Object.keys(policy.prices).length) ? policy.prices : (config.prices || {})
+  let prices = mergePrices(DEFAULT_PRICES, overlay)
   const costWeight = typeof config.costWeight === 'number' ? config.costWeight : 20
   const costCap = typeof config.costCap === 'number' ? config.costCap : 0.5
+  const crossProvider = config.crossProvider !== false
 
   const state = freshState()
   state.mode = policy.mode || config.mode || 'shadow'
+  state.crossProvider = crossProvider
   if (typeof policy.forced === 'string') state.forced = policy.forced
 
   // 飞轮恢复：重放 rewards.jsonl 重建 UCB/LinUCB/k-NN/EXP3；
@@ -350,7 +368,7 @@ export function apply(ctx, config = {}) {
     const f = featuresOf(cls, text)
     // 只探索当前 provider 有候选模型的档位（跳过无候选的"幽灵档"，
     // 如 mid 无模型时探索 mid 只会白费并回退到最贵的 strong）
-    const available = availableTiersFor(provider, state.modelTiers)
+    const available = availableTiersFor(provider, state.modelTiers, state.crossProvider)
     const recs = {
       rule: recommendRule(cls),
       ucb: recommendUcb(cls, state.ucb, available),
@@ -365,17 +383,22 @@ export function apply(ctx, config = {}) {
     }
     const meta = metaPick(recs, exp3)
     const chosenRec = meta.byName[meta.chosen] || recs.rule
-    const resolved = state.forced
-      ? { target: state.forced, used: 'forced', note: 'forced' }
-      : resolveTier(chosenRec.tier, provider, state.modelTiers)
+    let resolved = state.forced
+      ? (() => { const pf = parseForced(state.forced); return { target: pf.model, provider: pf.provider, used: 'forced', note: 'forced' } })()
+      : resolveTier(chosenRec.tier, provider, state.modelTiers, { crossProvider: state.crossProvider })
+    // 首回合/无 provider：active 模式下等首个 request 拿到真实 provider 后再解析、应用与落盘
+    const defer = state.mode === 'active' && !provider && !state.forced
+    if (defer) resolved = { target: null, provider: null, used: 'pending', note: 'provider-unknown' }
     const target = resolved.target
+    const targetProvider = resolved.provider || null
     state.seq += 1
     const td = {
       clsType: cls.type, f, recs, meta, chosen: meta.chosen,
       finalized: false, t0: now(), toolErrors: 0, retries: 0,
       currentModel: current, provider, costWeight, costCap,
       estInputTokens: Math.ceil(text.length / 1.5),
-      target, applied: false, needsApply: false, actualModel: current,
+      target, targetProvider, applied: false, needsApply: false, actualModel: current,
+      awaitProvider: defer, recordCommitted: false,
       // 回合级基线（供步骤级路由 v1.5.0 参考：无重型工具时保持该档）
       turnTier: target ? tierOf(target) : null, turnTarget: target,
     }
@@ -398,6 +421,8 @@ export function apply(ctx, config = {}) {
       metaPool: meta.pool,
       resolvedTier: resolved.used + (resolved.note ? ' [' + resolved.note + ']' : ''),
       targetModel: state.mode === 'active' ? target : null,
+      targetProvider: state.mode === 'active' ? targetProvider : null,
+      deferred: defer,
       applied: false,
       appliedAt: source,
       swapped: false,
@@ -409,10 +434,11 @@ export function apply(ctx, config = {}) {
   }
 
   // 决策记录落盘（在 applyDecision 之后调用，保证 applied/swapped 已是最终值）
-  function commitRecord(record) {
+  function commitRecord(record, td) {
     store.appendJsonl('decisions.jsonl', record)
     state.decisions.push(record)
     if (state.decisions.length > 200) state.decisions.shift()
+    if (td) td.recordCommitted = true
   }
 
   // 应用切换：active 模式且目标与当前不同 → 追加 request/header。
@@ -421,7 +447,7 @@ export function apply(ctx, config = {}) {
     if (state.mode !== 'active' || !target) return false
     const base = td.actualModel || td.currentModel
     if (base && target === base) return false
-    const ok = session ? appendRouterHeader(session, target) : false
+    const ok = session ? appendRouterHeader(session, target, 'router', td.targetProvider || null) : false
     td.applied = ok
     if (record) { record.applied = ok; record.swapped = ok }
     if (ok) {
@@ -444,7 +470,7 @@ export function apply(ctx, config = {}) {
       const r = decideAndRecord(payload, text, current, provider, 'inbox')
       if (!r) return
       applyDecision(session, r.key, r.td, r.record, r.target)
-      commitRecord(r.record)
+      if (!r.td.awaitProvider) commitRecord(r.record, r.td)
       log('decision #' + state.seq + ' type=' + r.td.clsType + ' c=' + r.td.f[1] +
         ' meta=' + r.td.chosen + ' tier=' + r.record.resolvedTier +
         ' applied=' + r.td.applied + ' target=' + (r.target || '-'))
@@ -470,21 +496,23 @@ export function apply(ctx, config = {}) {
       const key = fullKey(payload)
       const td = state.turnDecision[key]
       if (!td || td.finalized) return next()
+      if (state.forced) return next() // 强制模型时跳过步骤级升降档（force 钉死模型）
       const tools = lastToolCalls(session)
       if (!tools.length) return next() // 上一步是纯文本（通常回合收尾），保持现状
       const heavy = tools.some((n) => HEAVY_TOOLS.has(n))
       const stepTier = heavy ? 'strong' : (td.turnTier || null)
       if (!stepTier) return next()
       const provider = td.provider || currentProvider(session) || ''
-      const resolved = resolveTier(stepTier, provider, state.modelTiers)
+      const resolved = resolveTier(stepTier, provider, state.modelTiers, { crossProvider: state.crossProvider })
       const target = resolved.target
+      const targetProvider = resolved.provider || null
       const cur = currentModel(session)
       const changed = target && target !== cur
       // 注意：pre-step 在组装之后、buildRequest（loop 追加自己的 header）之前触发。
       // 这里直接追加会被本步 buildRequest 的 change(旧模型) 覆盖（与 v1.4.0 冷启动同款竞态）。
       // 因此只决策并挂起，真正追加推迟到 llm/stream 收尾（此时 loop 的 header 已落盘）。
-      if (changed) td.stepTarget = target
-      const stepRec = { turn: key, step: payload.step, lastTools: tools.slice(0, 5), stepTier, target, current: cur, applied: false, pending: changed, ts: Date.now() }
+      if (changed) { td.stepTarget = target; td.stepTargetProvider = targetProvider }
+      const stepRec = { turn: key, step: payload.step, lastTools: tools.slice(0, 5), stepTier, target, provider: targetProvider, current: cur, applied: false, pending: changed, ts: Date.now() }
       if (changed) td.stepRec = stepRec
       state.stepLog.push(stepRec)
       if (state.stepLog.length > 30) state.stepLog.shift()
@@ -505,22 +533,43 @@ export function apply(ctx, config = {}) {
       if (!timer || typeof timer.interval !== 'function') settleFeedback().catch(() => {})
       const key = fullKey(payload)
       const model = typeof cfg.model === 'string' ? cfg.model : null
+      const provider = typeof cfg.provider === 'string' ? cfg.provider : ''
       const td = state.turnDecision[key]
       if (td) {
         if (model) {
           td.actualModel = model
           state.lastActual = { model, turn: payload.turn, step: payload.step, key }
         }
+        if (provider) td.provider = provider
+        if (td.awaitProvider && !td.finalized) {
+          const chosenRec = (td.recs && td.recs[td.chosen]) || td.recs.rule
+          let resolved = state.forced
+            ? (() => { const pf = parseForced(state.forced); return { target: pf.model, provider: pf.provider, used: 'forced', note: 'forced' } })()
+            : resolveTier(chosenRec.tier, provider, state.modelTiers, { crossProvider: state.crossProvider })
+          td.target = resolved.target
+          td.targetProvider = resolved.provider || null
+          td.turnTier = td.target ? tierOf(td.target) : null
+          td.turnTarget = td.target
+          td.awaitProvider = false
+          if (td.rec) {
+            td.rec.resolvedTier = resolved.used + (resolved.note ? ' [' + resolved.note + ']' : '')
+            td.rec.targetModel = state.mode === 'active' ? td.target : null
+            td.rec.targetProvider = state.mode === 'active' ? td.targetProvider : null
+            td.rec.currentModel = model
+          }
+          if (!td.recordCommitted) commitRecord(td.rec, td)
+          td.needsApply = state.mode === 'active' && td.target && td.target !== model
+          log('decision #' + state.seq + ' resolved@request tier=' + td.rec.resolvedTier + ' target=' + (td.target || '-') + ' needsApply=' + td.needsApply)
+        }
         return cfg
       }
       const pkey = agentKey(payload) + ':' + payload.turn
       const text = state.pending.get(pkey) || ''
       state.pending.delete(pkey)
-      const provider = typeof cfg.provider === 'string' ? cfg.provider : ''
       const r = decideAndRecord(payload, text, model, provider, 'request')
       if (r) {
         r.td.needsApply = state.mode === 'active' && r.target && r.target !== r.td.currentModel
-        commitRecord(r.record)
+        if (!r.td.awaitProvider) commitRecord(r.record, r.td)
         if (r.td.needsApply) log('decision #' + state.seq + ' -> apply deferred to llm/stream')
         else log('decision #' + state.seq + ' type=' + r.td.clsType + ' meta=' + r.td.chosen + ' tier=' + r.record.resolvedTier)
       }
@@ -571,15 +620,16 @@ export function apply(ctx, config = {}) {
               if (sessions && typeof sessions.get === 'function') session = sessions.get(sid) || null
             } catch (e) { session = null }
             if (session) {
-              if (td.stepTarget && td.stepTarget !== currentModel(session)) {
-                const ok = appendRouterHeader(session, td.stepTarget, 'router-step')
+              if (td.stepTarget && !state.forced && (td.stepTarget !== currentModel(session) || (td.stepTargetProvider && td.stepTargetProvider !== currentProvider(session)))) {
+                const ok = appendRouterHeader(session, td.stepTarget, 'router-step', td.stepTargetProvider || null)
                 if (ok) {
                   state.counters.stepSwitches++
                   if (td.stepRec) { td.stepRec.applied = true }
-                  log('STEP-SWAP -> ' + td.stepTarget + (td.stepRec ? ' (tools: ' + td.stepRec.lastTools.join(',') + ')' : ''))
+                  log('STEP-SWAP -> ' + td.stepTarget + (td.stepTargetProvider ? ' (' + td.stepTargetProvider + ')' : '') + (td.stepRec ? ' [tools: ' + td.stepRec.lastTools.join(',') + ']' : ''))
                 }
               }
               td.stepTarget = null
+              td.stepTargetProvider = null
               if (td.needsApply && !td.applied) applyDecision(session, key, td, td.rec, td.target)
             }
             const u = td.usage || { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, reasoningTokens: 0, estimated: false }
@@ -633,6 +683,7 @@ export function apply(ctx, config = {}) {
       const td = state.turnDecision[key]
       if (!td || td.finalized) return
       td.finalized = true
+      if (!td.recordCommitted && td.rec) commitRecord(td.rec, td)
       const t1 = now()
       const dtMs = t1 != null && td.t0 != null ? t1 - td.t0 : null
       const r = rewardOf(td, tag, dtMs)
@@ -703,6 +754,7 @@ export function apply(ctx, config = {}) {
       return {
         mode: state.mode,
         forcedModel: state.forced,
+        crossProvider: state.crossProvider,
         totalDecisions: state.seq,
         modelTiers: state.modelTiers,
         prices,
@@ -743,7 +795,7 @@ export function apply(ctx, config = {}) {
   })
   register({
     name: 'agentic_router_force',
-    description: '强制后续请求使用指定模型 id（仅 active 模式生效）；clear=true 清除强制，恢复规则路由。',
+    description: '强制后续请求使用指定模型 id（仅 active 模式生效，支持 model 或 provider/model）；clear=true 清除强制，恢复规则路由。',
     parameters: {
       type: 'object',
       properties: {
@@ -764,14 +816,15 @@ export function apply(ctx, config = {}) {
         store.savePolicy({ mode: state.mode, forced: args.model, prices })
         // 立即对存活会话应用（下一请求生效）
         if (state.mode === 'active') {
+          const pf = parseForced(args.model)
           try {
             const agents = ctx.get('agents')
             if (agents && typeof agents.list === 'function') {
               for (const agent of agents.list()) {
                 try {
                   const session = sessionOf({ agent })
-                  if (session && currentModel(session) !== args.model) {
-                    const ok = appendRouterHeader(session, args.model)
+                  if (session && currentModel(session) !== pf.model) {
+                    const ok = appendRouterHeader(session, pf.model, 'router', pf.provider)
                     if (ok) state.headerAppends++
                   }
                 } catch (e) { /* per-agent best effort */ }
