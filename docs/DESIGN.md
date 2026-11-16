@@ -261,7 +261,7 @@ loop 每步顺序：`inbox.claim()`（发 `agent/inbox/claimed`）→ `systemPro
 ### 13.5 边界与后续
 
 - 奖励飞轮仍按回合结算（回合基线的策略选择），步骤级是确定性规则；未来可把步骤级升降档纳入学习（如按工具调用频率学阈值）
-- 重型集合 `HEAVY_TOOLS` 是静态清单，可配置化
+- 重型集合 `HEAVY_TOOLS` 默认清单可用 `config.heavyTools` 追加（v1.7.0 已配置化）
 - 降级方向：重型步骤后的轻量步骤会回到基线（简单任务场景：写代码阶段 pro、前后问答 flash）
 
 ### 13.6 v1.6.0：跨 provider 解析、首回合延迟与 force 钉死

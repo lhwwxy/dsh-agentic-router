@@ -38,6 +38,7 @@ const KNN_GRADUATION = 30   // k-NN 毕业经验线
 const SETTLE_DELAY_MS = 45000 // 反馈结算窗口：回合结束 45s 后查询 messageFeedback
 const SWEEP_MS = 15000        // 结算轮询周期
 const TIERS_TTL_MS = 600000   // 模型目录 TTL：默认 10 分钟自动重新探测（provider/模型增删自愈）
+const PROBE_TIMEOUT_MS = 15000 // 模型目录探测超时：llm 挂起时也要释放 probing 锁，避免 TTL 刷新永久停摆
 
 // 空档位表：插件不在代码里写死任何模型清单。启动时优先读本地缓存（models.json，
 // 上一次运行时探测的结果），无缓存则为空表——此时照常记录决策但不切换，
@@ -73,7 +74,7 @@ function freshState() {
     catalogSource: 'empty',
     probing: false,
     lastProbeAt: 0,
-    turnDecision: {},
+    turnDecision: new Map(), // 回合决策表：finalize 后退役为轻量墓碑并按上限修剪（防长会话内存增长）
     openTurns: new Map(),
     pendingFeedback: [],
     recByTurn: new Map(),
@@ -251,6 +252,12 @@ function parseForced(forced) {
   return { provider: null, model: forced }
 }
 
+// 强制模型的解析结果（decideAndRecord 与 request 延迟路径共用）
+function forcedResolution(forced) {
+  const pf = parseForced(forced)
+  return { target: pf.model, provider: pf.provider, used: 'forced', note: 'forced' }
+}
+
 // 步骤级路由（v1.5.0）：视为"重型工作"的工具调用——上一步出现它们时，
 // 下一步升级到 strong（pro）处理其结果/继续执行；轻量工具保持回合基线。
 const HEAVY_TOOLS = new Set([
@@ -314,6 +321,12 @@ export function apply(ctx, config = {}) {
   state.crossProvider = crossProvider
   if (typeof policy.forced === 'string') state.forced = policy.forced
 
+  // 步骤级路由的重型工具集合：默认清单 + config.heavyTools 追加（如自定义 MCP 工具名）
+  const heavyTools = new Set(HEAVY_TOOLS)
+  if (Array.isArray(config.heavyTools)) {
+    for (const t of config.heavyTools) if (typeof t === 'string' && t) heavyTools.add(t)
+  }
+
   // 模型目录：不写死。先读上次探测的本地缓存（models.json），没有则为空表。
   // 缓存里的 provider 可能已被删除——可用性以本次 llm 探测为准，所以启动时无条件重探。
   const cached = store.loadModels()
@@ -324,6 +337,14 @@ export function apply(ctx, config = {}) {
     log('model catalog from cache: ' + cached.providers.length + ' providers (ts=' + cached.ts + ')')
   }
   const tiersTtlMs = typeof config.tiersTtlMs === 'number' ? config.tiersTtlMs : TIERS_TTL_MS
+  const probeTimeoutMs = typeof config.probeTimeoutMs === 'number' ? config.probeTimeoutMs : PROBE_TIMEOUT_MS
+
+  // JSONL 压实：三个追加式日志只保留最近 compactLines 行（默认 1 万，0 关闭），
+  // 控制磁盘占用与启动重放开销（在下方 rewards/decisions 加载之前执行）。
+  const compactLines = typeof config.compactLines === 'number' ? config.compactLines : 10000
+  if (compactLines > 0) {
+    for (const n of ['decisions.jsonl', 'rewards.jsonl', 'steps.jsonl']) store.compactJsonl(n, compactLines)
+  }
 
   // 探测：并发保护 + TTL + 失败保留旧缓存。成功后覆盖 state 并落盘 models.json。
   async function probeCatalog(reason) {
@@ -331,7 +352,14 @@ export function apply(ctx, config = {}) {
     state.probing = true
     state.lastProbeAt = Date.now() // 无论成败都算"尝试过"，TTL 内不再重试，避免失败风暴
     try {
-      const t = await refreshModelTiers(llm)
+      // 超时保护：探测挂起时按超时返回 null，保证 probing 锁总会释放（TTL 刷新不永久停摆）
+      const t = await Promise.race([
+        refreshModelTiers(llm),
+        new Promise((resolve) => {
+          const h = setTimeout(() => resolve(null), probeTimeoutMs)
+          if (typeof h.unref === 'function') h.unref()
+        }),
+      ])
       if (t && t.providers.length) {
         state.modelTiers = t
         state.catalogTs = state.lastProbeAt
@@ -350,9 +378,10 @@ export function apply(ctx, config = {}) {
     }
   }
   // TTL 惰性刷新：回合内每步 request 路径都会检查，过期则后台重探（不阻塞决策）。
+  // 用 >=：tiersTtlMs=0 表示"永远过期"（每步都重探），避免同毫秒内 0>0 误判为未过期。
   function maybeRefreshCatalog() {
     if (state.probing) return
-    const stale = !state.catalogTs || (Date.now() - (state.lastProbeAt || 0) > tiersTtlMs)
+    const stale = !state.catalogTs || (Date.now() - (state.lastProbeAt || 0) >= tiersTtlMs)
     if (stale) probeCatalog('ttl').catch(() => {})
   }
 
@@ -373,7 +402,7 @@ export function apply(ctx, config = {}) {
     if (baseRec) correctReward(state, baseRec, rec.newReward)
   }
   state.recByTurn = byTurn
-  state.decisions = store.loadJsonl('decisions.jsonl').slice(-60)
+  state.decisions = store.loadJsonl('decisions.jsonl').slice(-200)
   state.seq = state.decisions.length ? state.decisions[state.decisions.length - 1].seq : 0
 
   if (rewards.length) log('replayed ' + rewards.length + ' rewards; ucb.total=' + state.ucb.total)
@@ -413,6 +442,9 @@ export function apply(ctx, config = {}) {
         }
       } catch (e) {
         log('feedback settle failed: ' + String(e))
+        // 瞬时失败（mf.list 抖动）最多重试 2 次，不直接丢掉该回合的反馈结算
+        p.tries = (p.tries || 0) + 1
+        if (p.tries <= 2) remaining.push(p)
       }
     }
     state.pendingFeedback = remaining
@@ -428,7 +460,7 @@ export function apply(ctx, config = {}) {
   // 目录未就绪时照常记录决策但不切换，不 await、不延期——否则追加 header 会落到 prompt 组装之后。
   function decideAndRecord(payload, text, current, provider, source) {
     const key = fullKey(payload)
-    if (state.turnDecision[key]) return null
+    if (state.turnDecision.has(key)) return null
     const cls = classify(text)
     const f = featuresOf(cls, text)
     // 只探索当前 provider 有候选模型的档位（跳过无候选的"幽灵档"，
@@ -449,7 +481,7 @@ export function apply(ctx, config = {}) {
     const meta = metaPick(recs, exp3)
     const chosenRec = meta.byName[meta.chosen] || recs.rule
     let resolved = state.forced
-      ? (() => { const pf = parseForced(state.forced); return { target: pf.model, provider: pf.provider, used: 'forced', note: 'forced' } })()
+      ? forcedResolution(state.forced)
       : resolveTier(chosenRec.tier, provider, state.modelTiers, { crossProvider: state.crossProvider })
     // 首回合/无 provider：active 模式下等首个 request 拿到真实 provider 后再解析、应用与落盘
     const defer = state.mode === 'active' && !provider && !state.forced
@@ -493,7 +525,7 @@ export function apply(ctx, config = {}) {
       swapped: false,
     }
     td.rec = record
-    state.turnDecision[key] = td
+    state.turnDecision.set(key, td)
     state.openTurns.set(agentKey(payload), key)
     return { key, td, record, target }
   }
@@ -559,12 +591,12 @@ export function apply(ctx, config = {}) {
       const session = sessionOf(payload)
       if (!session) return next()
       const key = fullKey(payload)
-      const td = state.turnDecision[key]
+      const td = state.turnDecision.get(key)
       if (!td || td.finalized) return next()
       if (state.forced) return next() // 强制模型时跳过步骤级升降档（force 钉死模型）
       const tools = lastToolCalls(session)
       if (!tools.length) return next() // 上一步是纯文本（通常回合收尾），保持现状
-      const heavy = tools.some((n) => HEAVY_TOOLS.has(n))
+      const heavy = tools.some((n) => heavyTools.has(n))
       const stepTier = heavy ? 'strong' : (td.turnTier || null)
       if (!stepTier) return next()
       const provider = td.provider || currentProvider(session) || ''
@@ -600,7 +632,12 @@ export function apply(ctx, config = {}) {
       const key = fullKey(payload)
       const model = typeof cfg.model === 'string' ? cfg.model : null
       const provider = typeof cfg.provider === 'string' ? cfg.provider : ''
-      const td = state.turnDecision[key]
+      // 先回收 pre-step 捕获的 pending 文本：inbox 主路径（td 已存在）也必须删除，
+      // 否则 Map 随回合数无限增长（每回合残留一条）
+      const pkey = agentKey(payload) + ':' + payload.turn
+      const text = state.pending.get(pkey) || ''
+      state.pending.delete(pkey)
+      const td = state.turnDecision.get(key)
       if (td) {
         if (model) {
           td.actualModel = model
@@ -629,9 +666,6 @@ export function apply(ctx, config = {}) {
         }
         return cfg
       }
-      const pkey = agentKey(payload) + ':' + payload.turn
-      const text = state.pending.get(pkey) || ''
-      state.pending.delete(pkey)
       const r = decideAndRecord(payload, text, model, provider, 'request')
       if (r) {
         r.td.needsApply = state.mode === 'active' && r.target && r.target !== r.td.currentModel
@@ -649,7 +683,7 @@ export function apply(ctx, config = {}) {
     try {
       // 请求失败（可能是模型/provider 已下线）→ 立即触发重探模型目录，及时剔除失效项
       probeCatalog('request-error').catch(() => {})
-      const td = state.turnDecision[fullKey(payload)]
+      const td = state.turnDecision.get(fullKey(payload))
       if (td && !td.finalized) {
         td.retries = (td.retries || 0) + 1
         log('retry on ' + fullKey(payload) + ' count=' + td.retries)
@@ -677,7 +711,7 @@ export function apply(ctx, config = {}) {
         try {
           const sid = options && (options.sessionId || (options.session && options.session.id))
           const key = sid ? state.openTurns.get(sid) : null
-          const td = key ? state.turnDecision[key] : null
+          const td = key ? state.turnDecision.get(key) : null
           if (td && !td.finalized) {
             // 延迟应用（此时循环自身 header 已落盘，追加无竞态）：
             // 1) 步骤级路由挂起的升降档（router-step）
@@ -735,7 +769,7 @@ export function apply(ctx, config = {}) {
       if (!ak) return
       const key = state.openTurns.get(ak)
       if (!key) return
-      const td = state.turnDecision[key]
+      const td = state.turnDecision.get(key)
       if (td && !td.finalized) {
         td.toolErrors = (td.toolErrors || 0) + 1
         log('tool error on ' + key + ' count=' + td.toolErrors)
@@ -745,10 +779,21 @@ export function apply(ctx, config = {}) {
     }
   })
 
+  // 决策表退役：turn 结束后完整 td（recs/meta/record 等）不再被引用，换成轻量墓碑
+  // （保留 finalized 语义：阻止同 turn 重复决策、让迟到事件安全跳过），并按上限修剪 Map。
+  function retireTurnDecision(key) {
+    state.turnDecision.set(key, { finalized: true })
+    while (state.turnDecision.size > 400) {
+      const first = state.turnDecision.keys().next().value
+      if (first === undefined) break
+      state.turnDecision.delete(first)
+    }
+  }
+
   const finalize = (payload, tag) => {
     try {
       const key = fullKey(payload)
-      const td = state.turnDecision[key]
+      const td = state.turnDecision.get(key)
       if (!td || td.finalized) return
       td.finalized = true
       if (!td.recordCommitted && td.rec) commitRecord(td.rec, td)
@@ -781,6 +826,8 @@ export function apply(ctx, config = {}) {
       }
       const ak = agentKey(payload)
       if (state.openTurns.get(ak) === key) state.openTurns.delete(ak)
+      state.pending.delete(ak + ':' + payload.turn) // 兜底回收 pending 文本
+      retireTurnDecision(key)
       log('reward ' + rec.reward + ' ' + tag + ' on ' + key + ' breakdown=' + JSON.stringify(r.breakdown))
     } catch (e) {
       log('finalize failed: ' + String(e))
@@ -831,6 +878,7 @@ export function apply(ctx, config = {}) {
         },
         prices,
         mechanism: 'request/header append (inbox turn-level + pre-step step-level v1.5.0; model catalog probed at runtime + cached locally)',
+        heavyTools: Array.from(heavyTools),
         lastActual: state.lastActual,
         headerAppends: state.headerAppends,
         stepSwitches: state.counters.stepSwitches,
@@ -842,7 +890,7 @@ export function apply(ctx, config = {}) {
           exp3: state.exp3,
           pendingFeedback: state.pendingFeedback.length,
           prices,
-          recentRewards: store.loadJsonl('rewards.jsonl').slice(-20),
+          recentRewards: store.loadJsonlTail('rewards.jsonl', 20), // 只读尾部，避免整文件解析
         },
         recent: state.decisions.slice(-20),
         note: '切换真实性验证：headerAppends 为本进程追加的 request/header 次数；stepSwitches 为步骤级升级/降级次数（stepLog 有明细）；lastActual 为最近一步真实出网模型',

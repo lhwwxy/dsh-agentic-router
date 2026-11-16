@@ -158,7 +158,7 @@ test('applyReward：更新 UCB/LinUCB/k-NN/EXP3 四个学习器', () => {
   assert.ok(state.exp3.weights.rule > DEFAULT_WEIGHTS.rule, '被选策略权重应上升')
 })
 
-test('metaPick：冷启动只有 ucb+rule 入池，rule 初始权重 2.5 占优', () => {
+test('metaPick：冷启动只有 ucb+rule 入池，rule 初始权重 2.5 占优（含 γ 混合）', () => {
   const recs = {
     rule: { tier: 'fast', conf: 0.5 },
     ucb: { tier: 'fast', conf: 0.2 },
@@ -168,8 +168,35 @@ test('metaPick：冷启动只有 ucb+rule 入池，rule 初始权重 2.5 占优'
   const exp3 = { weights: { ...DEFAULT_WEIGHTS }, linGraduated: false, knnGraduated: false }
   const m = metaPick(recs, exp3)
   assert.deepEqual(m.pool.sort(), ['rule', 'ucb'])
-  assert.ok(Math.abs(m.ps.rule - 2.5 / 3.5) < 1e-9)
+  // γ=0.05 混合：ps = 0.95·(w/Σw) + 0.05/|pool|
+  assert.ok(Math.abs(m.ps.rule - (0.95 * (2.5 / 3.5) + 0.05 / 2)) < 1e-9, '实际 ' + m.ps.rule)
+  assert.ok(Math.abs(m.ps.ucb + m.ps.rule - 1) < 1e-9, '概率应归一')
   assert.ok(m.byName[m.chosen])
+})
+
+test('metaPick γ 混合：权重为 0 的专家仍有保底概率（不会永久死亡）', () => {
+  const recs = {
+    rule: { tier: 'fast', conf: 0.5 },
+    ucb: { tier: 'fast', conf: 0.2 },
+    lin: { tier: 'fast', conf: 0.1 },
+    knn: { tier: null, conf: 0 },
+  }
+  const exp3 = { weights: { ucb: 0, linucb: 1, knn: 1, rule: 1e6 }, linGraduated: false, knnGraduated: false }
+  const m = metaPick(recs, exp3)
+  assert.ok(m.ps.ucb > 0, '权重 0 的 ucb 应有 γ/|pool| 的保底概率')
+  assert.ok(Math.abs(m.ps.ucb - 0.05 / 2) < 1e-9)
+})
+
+test('metaPick 退化保护：权重全 0 时均匀采样', () => {
+  const recs = {
+    rule: { tier: 'fast', conf: 0.5 },
+    ucb: { tier: 'fast', conf: 0.2 },
+    lin: { tier: 'fast', conf: 0.1 },
+    knn: { tier: null, conf: 0 },
+  }
+  const exp3 = { weights: { ucb: 0, linucb: 0, knn: 0, rule: 0 }, linGraduated: false, knnGraduated: false }
+  const m = metaPick(recs, exp3)
+  assert.ok(Math.abs(m.ps.rule - 0.5) < 1e-9 && Math.abs(m.ps.ucb - 0.5) < 1e-9)
 })
 
 test('k-NN 冷启动：经验不足时给 null 档', () => {
@@ -212,6 +239,24 @@ test('correctReward：反馈修正精确回退 UCB 均值与 EXP3 权重', () =>
   assert.ok(state.exp3.weights.rule < wBefore, 'EXP3 权重应乘性回退')
   assert.ok(Math.abs(state.exp3.weights.rule - DEFAULT_WEIGHTS.rule * Math.exp(0.3 * (0.5 / 0.7) / 2)) < 1e-9, 'EXP3 回退为精确逆运算')
   assert.equal(rec.reward, 0.5, '记录同步更新')
+})
+
+test('EXP3 权重防溢出：最大权重超阈值时整体等比缩放（相对比例不变）', () => {
+  const state = {
+    ucb: { total: 0, arms: {} },
+    lin: { total: 0, tierN: { fast: 0, mid: 0, strong: 0 }, tierW: { fast: new Array(9).fill(0), mid: new Array(9).fill(0), strong: new Array(9).fill(0) } },
+    knn: { pool: [] },
+    exp3: { total: 0, weights: { ucb: 1e6, linucb: 1e3, knn: 1, rule: 1e5 } },
+  }
+  const rec = { reward: 1, clsType: 'qa', ucbTier: 'fast', linTier: 'fast', f: [1, 0, 0, 0, 0, 0, 0, 0, 1], chosen: 'ucb', pChosen: 0.5, pool: ['ucb', 'rule'] }
+  applyReward(state, rec)
+  const ws = state.exp3.weights
+  const maxW = Math.max(...Object.values(ws))
+  assert.ok(maxW <= 1e6, '缩放后最大权重应回落到阈值内，实际 ' + maxW)
+  // 相对比例不受缩放影响：rule/ucb 仍等于更新因子作用后的比例
+  const factor = Math.exp(0.3 * (1 / 0.5) / 2)
+  assert.ok(Math.abs(ws.rule / ws.ucb - 1e5 / (1e6 * factor)) < 1e-9)
+  assert.ok(ws.knn > 0 && ws.linucb > 0, '其它权重不得被清零')
 })
 
 test('correctReward：无变化时不修正', () => {

@@ -2,7 +2,7 @@
 // 默认目录：${DSH_HOME:-~/.dsh}/storages/dsh-agentic-router（可被 config.home 或
 // AGENTIC_ROUTER_HOME 环境变量覆盖）。全部本地明文，可导出可审计。
 
-import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, appendFileSync, readdirSync } from 'node:fs'
+import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, appendFileSync, readdirSync, statSync, openSync, readSync, closeSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { homedir } from 'node:os'
 
@@ -45,13 +45,57 @@ export class Store {
   loadJsonl(name) {
     try {
       if (!existsSync(this.jsonlPath(name))) return []
-      return readFileSync(this.jsonlPath(name), 'utf8')
-        .split('\n')
-        .filter((l) => l.trim())
-        .map((l) => JSON.parse(l))
+      const out = []
+      for (const line of readFileSync(this.jsonlPath(name), 'utf8').split('\n')) {
+        if (!line.trim()) continue
+        // 单行损坏只跳过该行，不丢整个历史（此前一行坏 = 全部丢，重放恢复会清零）
+        try { out.push(JSON.parse(line)) } catch { /* skip corrupt line */ }
+      }
+      return out
     } catch {
       return []
     }
+  }
+
+  // 只读文件尾部（最多 64KB）解析最后 n 条：stats 等高频调用避免整文件解析
+  loadJsonlTail(name, n = 20) {
+    let fh = null
+    try {
+      const p = this.jsonlPath(name)
+      if (!existsSync(p)) return []
+      const size = statSync(p).size
+      if (!size) return []
+      const start = Math.max(0, size - 65536)
+      const len = size - start
+      const buf = Buffer.alloc(len)
+      fh = openSync(p, 'r')
+      readSync(fh, buf, 0, len, start)
+      let text = buf.toString('utf8')
+      if (start > 0) text = text.slice(text.indexOf('\n') + 1) // 丢弃可能被截断的首行
+      const out = []
+      for (const line of text.split('\n')) {
+        if (!line.trim()) continue
+        try { out.push(JSON.parse(line)) } catch { /* 截断行忽略 */ }
+      }
+      return out.slice(-n)
+    } catch {
+      return []
+    } finally {
+      if (fh != null) { try { closeSync(fh) } catch { /* best effort */ } }
+    }
+  }
+
+  // 压实：只保留最后 keep 行（启动时调用；控制追加式日志的磁盘与重放开销）
+  compactJsonl(name, keep) {
+    try {
+      const p = this.jsonlPath(name)
+      if (!keep || !existsSync(p)) return
+      const lines = readFileSync(p, 'utf8').split('\n').filter((l) => l.trim())
+      if (lines.length <= keep) return
+      const tmp = p + '.tmp'
+      writeFileSync(tmp, lines.slice(-keep).join('\n') + '\n')
+      renameSync(tmp, p)
+    } catch { /* 尽力而为 */ }
   }
 
   // 清空飞轮（重置学习状态），保留 policy

@@ -34,6 +34,8 @@ provider 后再决策应用；`agentic_router_force` 钉死模型、步骤级路
 
 **v1.6.2 会话重启 corrupt 修复**：`request/header` 的 `reason` 收敛为 DSH 唯一合法的 `change`（不再写 `router`/`router-step`，否则重启载入会话报 `invalid reason`）；切到 fast/mid 档删掉 `config.reasoningEffort` 时，同步清理 `header.adapterDefaults` 里无 config 支撑的 marker（否则载入报 `invalid adapterDefaults`），避免会话被判 corrupt、侧边栏历史丢失。
 
+**v1.7.0 稳定性与性能**：修复长会话内存增长（回合决策表 finalize 后退役为轻量墓碑并按 400 上限修剪；pending 文本每回合必回收）；模型目录探测加超时保护（默认 15s，`probeTimeoutMs` 可配），`llm.listModels` 挂起不再卡死 TTL 刷新；EXP3 加 γ=0.05 混合探索（权重被反馈压到 0 的专家不再永久死亡）与权重超阈值等比缩放防溢出；`loadJsonl` 单行损坏只跳过该行、不再丢整个历史（重放恢复更稳）；`agentic_router_stats` 改读 `rewards.jsonl` 尾部（不再整文件解析）并透出 `heavyTools`；启动时三个 JSONL 自动压实（默认各保留 1 万行，`compactLines: 0` 关闭）；反馈结算瞬时失败自动重试 2 次；步骤级路由的重型工具集合可用 `config.heavyTools` 追加自定义工具名。
+
 ## 架构
 
 ```

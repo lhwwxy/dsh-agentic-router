@@ -672,6 +672,42 @@ test('模型目录：provider 被删除后手动刷新立即剔除（模拟 zai 
   llm.listProviders = orig
 })
 
+test('探测超时：llm 探测挂起时 probing 锁也能释放（TTL 刷新不永久停摆）', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-router-probetimeout-'))
+  const ctx = mockCtx({ slowModels: true }) // listModels 永不 resolve
+  apply(ctx, { home, probeTimeoutMs: 30 })
+  await new Promise((r) => setTimeout(r, 80))
+  const stats = await ctx.registered.find((t) => t.name === 'agentic_router_stats').execute({}, {})
+  assert.equal(stats.modelCatalog.probing, false, '超时后 probing 必须释放')
+})
+
+test('回合退役：finalize 后迟到的 request/tools/stream 事件不重复决策、不报错', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-router-retire-'))
+  const session = mockSession('s1')
+  const sessions = new Map([['s1', session]])
+  const ctx = mockCtx({ sessions })
+  apply(ctx, { home, mode: 'active' })
+  await tick()
+  const inbox = ctx.listeners['agent/inbox/claimed']
+  const req = ctx.listeners['agent/request']
+  const stop = ctx.listeners['agent/turn-stopping']
+  const toolResult = ctx.listeners['tools/result']
+  const stream = ctx.listeners['llm/stream']
+  const P = (t, text) => ({ agent: { sessionId: 's1', session }, turn: t, step: 1, signal: {}, message: { role: 'user', content: [{ type: 'text', text }] } })
+
+  inbox(P(1, QA_TASK))
+  await stop(payload('s1', 1, session))
+  // 迟到的 request / 工具结果 / 流收尾：不得重复决策或抛错
+  await req(payload('s1', 1, session), async () => ({ provider: 'deepseek-official', model: 'deepseek-flash' }))
+  toolResult({ agent: { sessionId: 's1' } }, { status: 'error', error: 'late' })
+  const w = stream({ sessionId: 's1', provider: 'deepseek-official' }, async function* () { yield { type: 'finish', reason: 'stop' } })
+  for await (const c of w) { /* drain */ }
+
+  const store = new Store(home)
+  assert.equal(store.loadJsonl('decisions.jsonl').length, 1, '同一 turn 只落盘一次决策')
+  assert.equal(store.loadJsonl('rewards.jsonl').length, 1, '同一 turn 只结算一次奖励')
+})
+
 test('模型目录：TTL 到期后 request 路径自动重探（惰性刷新）', async () => {
   const home = mkdtempSync(join(tmpdir(), 'dsh-router-catalog-ttl-'))
   let calls = 0

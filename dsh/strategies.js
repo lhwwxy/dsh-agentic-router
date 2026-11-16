@@ -250,8 +250,16 @@ export function applyReward(state, rec) {
   if (state.knn.pool.length > 400) state.knn.pool.shift()
 
   if (rec.pChosen > 0) {
-    state.exp3.weights[rec.chosen] = (state.exp3.weights[rec.chosen] || 0) *
+    const ws = state.exp3.weights
+    ws[rec.chosen] = (ws[rec.chosen] || 0) *
       Math.exp(0.3 * (rec.reward / rec.pChosen) / rec.pool.length)
+    // 防无界增长：EXP3 只依赖权重间的相对比例，最大权重超阈值时整体等比缩放，
+    // 避免长期运行后溢出为 Infinity（等比缩放不改变任何相对比例，修正更新依然自洽）
+    let maxW = 0
+    for (const k of Object.keys(ws)) if (ws[k] > maxW) maxW = ws[k]
+    if (!isFinite(maxW) || maxW > 1e6) {
+      for (const k of Object.keys(ws)) ws[k] = isFinite(ws[k]) ? ws[k] / maxW : 1
+    }
   }
   state.exp3.total += 1
 }
