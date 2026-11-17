@@ -804,3 +804,26 @@ test('ε 探索：exploration=1 必探索可用档并标注 [explore]，explorat
   assert.ok(!d2[0].resolvedTier.includes('[explore]'))
   assert.equal(d2[0].targetModel, 'deepseek-flash')
 })
+
+test('结算用决策时模式：中途切 active 不把 shadow 决策的回合喂给飞轮', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-router-mmode-'))
+  const ctx = mockCtx()
+  apply(ctx, { exploration: 0, home, mode: 'shadow' })
+  await tick()
+  const inbox = ctx.listeners['agent/inbox/claimed']
+  const stop = ctx.listeners['agent/turn-stopping']
+  const session = mockSession('s1')
+  const P = (t, text) => ({ agent: { sessionId: 's1', session }, turn: t, step: 1, signal: {}, message: { role: 'user', content: [{ type: 'text', text }] } })
+
+  await inbox(P(1, QA_TASK)) // 决策发生在 shadow
+  const setMode = ctx.registered.find((t) => t.name === 'agentic_router_set_mode')
+  await setMode.execute({ mode: 'active' }, {}) // 中途切 active
+  await stop(payload('s1', 1, session)) // 结算仍按决策时 shadow 归属
+
+  const store = new Store(home)
+  const rewards = store.loadJsonl('rewards.jsonl')
+  assert.equal(rewards.length, 1)
+  assert.equal(rewards[0].mode, 'shadow', '观测行 mode 应为决策时快照')
+  const stats = await ctx.registered.find((t) => t.name === 'agentic_router_stats').execute({}, {})
+  assert.equal(stats.flywheel.ucb.total, 0, 'shadow 决策的回合不得因中途切 active 而进飞轮')
+})

@@ -508,6 +508,8 @@ export function apply(ctx, config = {}) {
     state.seq += 1
     const td = {
       clsType: cls.type, f, recs, meta, chosen: meta.chosen,
+      // 决策时模式快照：中途切 shadow/active 不影响已开始回合的应用与结算归属
+      mode: state.mode,
       finalized: false, t0: now(), toolErrors: 0, retries: 0,
       currentModel: current, provider, costWeight, costCap,
       estInputTokens: Math.ceil(text.length / 1.5),
@@ -558,7 +560,7 @@ export function apply(ctx, config = {}) {
   // 应用切换：active 模式且目标与当前不同 → 追加 request/header。
   // 返回是否真实追加成功。
   function applyDecision(session, key, td, record, target) {
-    if (state.mode !== 'active' || !target) return false
+    if (td.mode !== 'active' || !target) return false
     const base = td.actualModel || td.currentModel
     if (base && target === base) return false
     const ok = session ? appendRouterHeader(session, target, 'change', td.targetProvider || null) : false
@@ -822,7 +824,7 @@ export function apply(ctx, config = {}) {
         reward: r.reward,
         tag,
         breakdown: r.breakdown,
-        mode: state.mode, // shadow 观测行：启动重放时跳过，不参与飞轮重建
+        mode: td.mode, // 决策时模式快照（shadow 观测行重放时跳过，不参与飞轮重建）
         chosen: td.chosen,
         pool: td.meta ? td.meta.pool : [],
         pChosen: td.meta ? td.meta.ps[td.chosen] || 0 : 0,
@@ -831,7 +833,7 @@ export function apply(ctx, config = {}) {
         linTier: td.recs.lin.tier,
         f: td.f,
       }
-      if (state.mode === 'active') {
+      if (td.mode === 'active') {
         applyReward(state, rec)
         state.recByTurn.set(key, rec)
         if (state.recByTurn.size > 500) {
@@ -850,7 +852,7 @@ export function apply(ctx, config = {}) {
       if (state.openTurns.get(ak) === key) state.openTurns.delete(ak)
       state.pending.delete(ak + ':' + payload.turn) // 兜底回收 pending 文本
       retireTurnDecision(key)
-      log((state.mode === 'active' ? 'reward ' : 'observe (shadow, no training) ') + rec.reward + ' ' + tag + ' on ' + key + ' breakdown=' + JSON.stringify(r.breakdown))
+      log((td.mode === 'active' ? 'reward ' : 'observe (shadow, no training) ') + rec.reward + ' ' + tag + ' on ' + key + ' breakdown=' + JSON.stringify(r.breakdown))
     } catch (e) {
       log('finalize failed: ' + String(e))
     }
