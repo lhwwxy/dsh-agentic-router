@@ -253,12 +253,14 @@ export function applyReward(state, rec) {
     const ws = state.exp3.weights
     ws[rec.chosen] = (ws[rec.chosen] || 0) *
       Math.exp(0.3 * (rec.reward / rec.pChosen) / rec.pool.length)
-    // 防无界增长：EXP3 只依赖权重间的相对比例，最大权重超阈值时整体等比缩放，
-    // 避免长期运行后溢出为 Infinity（等比缩放不改变任何相对比例，修正更新依然自洽）
-    let maxW = 0
-    for (const k of Object.keys(ws)) if (ws[k] > maxW) maxW = ws[k]
-    if (!isFinite(maxW) || maxW > 1e6) {
-      for (const k of Object.keys(ws)) ws[k] = isFinite(ws[k]) ? ws[k] / maxW : 1
+    // 权重防爆保险：整体除以最大值（γ 混合已保证采样下限；此处防 float 溢出）。
+    // 关键是"地板"：反复归一化会让小权重下溢到精确 0（0×任何数=0，永久不可恢复）。
+    // 地板把最大权重比钳在 1e6 内——比例过宽（如 1e12）时，被冷落专家靠 γ 地板
+    // 采样翻身需要上千轮，主导权振荡周期过长；1e6 让恢复以百轮计。
+    let max = 0
+    for (const k of Object.keys(ws)) if (ws[k] > max) max = ws[k]
+    if (max > 1e50) {
+      for (const k of Object.keys(ws)) ws[k] = Math.max(ws[k] / max, 1e-6)
     }
   }
   state.exp3.total += 1

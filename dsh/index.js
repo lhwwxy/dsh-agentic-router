@@ -39,6 +39,7 @@ const SETTLE_DELAY_MS = 45000 // 反馈结算窗口：回合结束 45s 后查询
 const SWEEP_MS = 15000        // 结算轮询周期
 const TIERS_TTL_MS = 600000   // 模型目录 TTL：默认 10 分钟自动重新探测（provider/模型增删自愈）
 const PROBE_TIMEOUT_MS = 15000 // 模型目录探测超时：llm 挂起时也要释放 probing 锁，避免 TTL 刷新永久停摆
+const EXPLORATION_EPS = 0.08   // 档位级 ε 探索率（config.exploration 可调，0 关闭）
 
 // 空档位表：插件不在代码里写死任何模型清单。启动时优先读本地缓存（models.json，
 // 上一次运行时探测的结果），无缓存则为空表——此时照常记录决策但不切换，
@@ -64,6 +65,7 @@ function availableTiersFor(provider, modelTiers, crossProvider) {
 function freshState() {
   return {
     mode: 'shadow',
+    exploration: EXPLORATION_EPS,
     seq: 0,
     decisions: [],
     forced: null,
@@ -319,6 +321,9 @@ export function apply(ctx, config = {}) {
   const state = freshState()
   state.mode = policy.mode || config.mode || 'shadow'
   state.crossProvider = crossProvider
+  if (typeof config.exploration === 'number' && config.exploration >= 0) {
+    state.exploration = config.exploration
+  }
   if (typeof policy.forced === 'string') state.forced = policy.forced
 
   // 步骤级路由的重型工具集合：默认清单 + config.heavyTools 追加（如自定义 MCP 工具名）
@@ -386,11 +391,13 @@ export function apply(ctx, config = {}) {
   }
 
   // 飞轮恢复：重放 rewards.jsonl 重建 UCB/LinUCB/k-NN/EXP3；
+  // shadow 观测行（mode==='shadow'，回合由原模型服务）不参与重放；
   // feedback-settle 行在基础奖励重放后按 turn 精确修正
   const rewards = store.loadJsonl('rewards.jsonl')
   const byTurn = new Map()
   for (const rec of rewards) {
     if (rec.type === 'feedback-settle') continue
+    if (rec.mode === 'shadow') continue
     if (typeof rec.reward === 'number' && Array.isArray(rec.f)) {
       applyReward(state, rec)
       byTurn.set(rec.turn, rec)
@@ -480,9 +487,19 @@ export function apply(ctx, config = {}) {
     }
     const meta = metaPick(recs, exp3)
     const chosenRec = meta.byName[meta.chosen] || recs.rule
+    let tier = chosenRec.tier
+    // 档位级 ε 探索：EXP3 按实现奖励评判专家，会惩罚付探索成本的 UCB；贪婪专家
+    // 主导后没人再探索非首选档，正确档位的数据永远采不到。以 ε 概率随机路由一个
+    // 可用档位（available 已跳过无候选的"幽灵档"），reward 记在 used 档。
+    let explored = false
+    if (!state.forced && state.exploration > 0 && available.length > 1 && Math.random() < state.exploration) {
+      tier = available[Math.floor(Math.random() * available.length)]
+      explored = true
+    }
     let resolved = state.forced
       ? forcedResolution(state.forced)
-      : resolveTier(chosenRec.tier, provider, state.modelTiers, { crossProvider: state.crossProvider })
+      : resolveTier(tier, provider, state.modelTiers, { crossProvider: state.crossProvider })
+    if (explored && resolved) resolved = { ...resolved, note: (resolved.note || '') + ' [explore]' }
     // 首回合/无 provider：active 模式下等首个 request 拿到真实 provider 后再解析、应用与落盘
     const defer = state.mode === 'active' && !provider && !state.forced
     if (defer) resolved = { target: null, provider: null, used: 'pending', note: 'provider-unknown' }
@@ -805,6 +822,7 @@ export function apply(ctx, config = {}) {
         reward: r.reward,
         tag,
         breakdown: r.breakdown,
+        mode: state.mode, // shadow 观测行：启动重放时跳过，不参与飞轮重建
         chosen: td.chosen,
         pool: td.meta ? td.meta.pool : [],
         pChosen: td.meta ? td.meta.ps[td.chosen] || 0 : 0,
@@ -813,22 +831,26 @@ export function apply(ctx, config = {}) {
         linTier: td.recs.lin.tier,
         f: td.f,
       }
-      applyReward(state, rec)
+      if (state.mode === 'active') {
+        applyReward(state, rec)
+        state.recByTurn.set(key, rec)
+        if (state.recByTurn.size > 500) {
+          const first = state.recByTurn.keys().next().value
+          if (first !== undefined) state.recByTurn.delete(first)
+        }
+        if (mf && typeof mf.list === 'function' && td.t0 != null) {
+          state.pendingFeedback.push({ key, sessionId: agentKey(payload), t0: td.t0, appliedReward: rec.reward })
+          if (state.pendingFeedback.length > 200) state.pendingFeedback.shift()
+        }
+      }
+      // shadow：回合由原模型服务，其结果不能归因于路由档位——只落观测（重放跳过），
+      // 不喂飞轮、不参与反馈修正。
       store.appendJsonl('rewards.jsonl', rec)
-      state.recByTurn.set(key, rec)
-      if (state.recByTurn.size > 500) {
-        const first = state.recByTurn.keys().next().value
-        if (first !== undefined) state.recByTurn.delete(first)
-      }
-      if (mf && typeof mf.list === 'function' && td.t0 != null) {
-        state.pendingFeedback.push({ key, sessionId: agentKey(payload), t0: td.t0, appliedReward: rec.reward })
-        if (state.pendingFeedback.length > 200) state.pendingFeedback.shift()
-      }
       const ak = agentKey(payload)
       if (state.openTurns.get(ak) === key) state.openTurns.delete(ak)
       state.pending.delete(ak + ':' + payload.turn) // 兜底回收 pending 文本
       retireTurnDecision(key)
-      log('reward ' + rec.reward + ' ' + tag + ' on ' + key + ' breakdown=' + JSON.stringify(r.breakdown))
+      log((state.mode === 'active' ? 'reward ' : 'observe (shadow, no training) ') + rec.reward + ' ' + tag + ' on ' + key + ' breakdown=' + JSON.stringify(r.breakdown))
     } catch (e) {
       log('finalize failed: ' + String(e))
     }

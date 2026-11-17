@@ -241,7 +241,26 @@ test('correctReward：反馈修正精确回退 UCB 均值与 EXP3 权重', () =>
   assert.equal(rec.reward, 0.5, '记录同步更新')
 })
 
-test('EXP3 权重防溢出：最大权重超阈值时整体等比缩放（相对比例不变）', () => {
+test('EXP3 权重防爆：超 1e50 才等比缩放，且带 1e-6 地板（防精确 0 下溢）', () => {
+  const state = {
+    ucb: { total: 0, arms: {} },
+    lin: { total: 0, tierN: { fast: 0, mid: 0, strong: 0 }, tierW: { fast: new Array(9).fill(0), mid: new Array(9).fill(0), strong: new Array(9).fill(0) } },
+    knn: { pool: [] },
+    exp3: { total: 0, weights: { ucb: 1e60, linucb: 1e55, knn: 1, rule: 1e58 } },
+  }
+  const rec = { reward: 1, clsType: 'qa', ucbTier: 'fast', linTier: 'fast', f: [1, 0, 0, 0, 0, 0, 0, 0, 1], chosen: 'ucb', pChosen: 0.5, pool: ['ucb', 'rule'] }
+  applyReward(state, rec)
+  const ws = state.exp3.weights
+  // 除以最大值后 ucb ≈ 1；knn 原为 1/1e60 → 下溢为 0，被地板钳到 1e-6
+  assert.ok(ws.ucb > 0.9 && ws.ucb < 1.1, 'ucb 应归一到 1 附近，实际 ' + ws.ucb)
+  assert.equal(ws.knn, 1e-6, '被冷落专家应被地板钳到 1e-6，而不是精确 0')
+  assert.ok(ws.linucb > 1e-6 && ws.rule > 1e-6, '其它权重保持正数')
+  // 最大权重比被钳在 1e6 内（γ 地板让被冷落专家能以百轮计翻身）
+  const ratio = Math.max(...Object.values(ws)) / Math.min(...Object.values(ws))
+  assert.ok(ratio <= 1e6 + 1, '最大权重比应 ≤ 1e6，实际 ' + ratio)
+})
+
+test('EXP3 权重正常区间不缩放（保留精确相对比例）', () => {
   const state = {
     ucb: { total: 0, arms: {} },
     lin: { total: 0, tierN: { fast: 0, mid: 0, strong: 0 }, tierW: { fast: new Array(9).fill(0), mid: new Array(9).fill(0), strong: new Array(9).fill(0) } },
@@ -251,12 +270,9 @@ test('EXP3 权重防溢出：最大权重超阈值时整体等比缩放（相对
   const rec = { reward: 1, clsType: 'qa', ucbTier: 'fast', linTier: 'fast', f: [1, 0, 0, 0, 0, 0, 0, 0, 1], chosen: 'ucb', pChosen: 0.5, pool: ['ucb', 'rule'] }
   applyReward(state, rec)
   const ws = state.exp3.weights
-  const maxW = Math.max(...Object.values(ws))
-  assert.ok(maxW <= 1e6, '缩放后最大权重应回落到阈值内，实际 ' + maxW)
-  // 相对比例不受缩放影响：rule/ucb 仍等于更新因子作用后的比例
   const factor = Math.exp(0.3 * (1 / 0.5) / 2)
-  assert.ok(Math.abs(ws.rule / ws.ucb - 1e5 / (1e6 * factor)) < 1e-9)
-  assert.ok(ws.knn > 0 && ws.linucb > 0, '其它权重不得被清零')
+  assert.ok(Math.abs(ws.rule / ws.ucb - 1e5 / (1e6 * factor)) < 1e-9, '相对比例不受影响')
+  assert.equal(ws.knn, 1, '未触阈值时权重不动')
 })
 
 test('correctReward：无变化时不修正', () => {
