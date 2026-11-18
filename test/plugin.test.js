@@ -827,3 +827,18 @@ test('结算用决策时模式：中途切 active 不把 shadow 决策的回合�
   const stats = await ctx.registered.find((t) => t.name === 'agentic_router_stats').execute({}, {})
   assert.equal(stats.flywheel.ucb.total, 0, 'shadow 决策的回合不得因中途切 active 而进飞轮')
 })
+
+test('纯空白内容跳过路由（无文本不产生决策）', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-router-ws-'))
+  const ctx = mockCtx()
+  apply(ctx, { exploration: 0, home })
+  await tick()
+  const inbox = ctx.listeners['agent/inbox/claimed']
+  const session = mockSession('s1')
+  const P = (t, text) => ({ agent: { sessionId: 's1', session }, turn: t, step: 1, signal: {}, message: { role: 'user', content: [{ type: 'text', text }] } })
+
+  await inbox(P(1, '   \n\t  ')) // 纯空白
+
+  const store = new Store(home)
+  assert.equal(store.loadJsonl('decisions.jsonl').length, 0, '纯空白内容不得产生决策记录')
+})

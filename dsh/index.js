@@ -132,14 +132,14 @@ function textOfMessages(messages) {
 
 function extractText(message) {
   if (message == null) return ''
-  if (typeof message.text === 'string') return message.text
+  if (typeof message.text === 'string') return message.text.trim()
   const blocks = message.content
   if (Array.isArray(blocks)) {
     let out = ''
     for (const b of blocks) {
       if (b && typeof b === 'object' && b.type === 'text' && typeof b.text === 'string') out += b.text + '\n'
     }
-    return out
+    return out.trim() // 纯空白内容（如空输入/纯空白块）视为无文本，跳过路由
   }
   return ''
 }
